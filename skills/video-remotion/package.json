@@ -1,0 +1,14 @@
+{
+  "name": "langgraph-study-video-remotion-skill",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Project skill metadata for Remotion-based K12 video rendering. Runtime dependencies live in ../../video-renderer.",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/remotion-dev/skills",
+    "directory": "skills/remotion"
+  },
+  "scripts": {
+    "check": "echo \"This is a Cursor skill. Use ../../video-renderer for Remotion runtime.\""
+  }
+}

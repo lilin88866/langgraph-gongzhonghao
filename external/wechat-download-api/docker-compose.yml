@@ -1,0 +1,12 @@
+services:
+  wechat-download-api:
+    image: tmwgsicp/wechat-download-api:latest
+    container_name: langgraph-study-wechat-download-api
+    env_file:
+      - .env
+    ports:
+      - "5000:5000"
+    volumes:
+      - ./data:/app/data
+      - ./.env:/app/.env
+    restart: unless-stopped

@@ -1,0 +1,21 @@
+{
+  "name": "langgraph-study-video-renderer",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "studio": "remotion studio src/index.ts",
+    "render": "remotion render src/index.ts ProblemSolving3DVideo",
+    "render:conical-pendulum": "remotion render src/index.ts ConicalPendulumVideo"
+  },
+  "dependencies": {
+    "@remotion/cli": "latest",
+    "react": "latest",
+    "react-dom": "latest",
+    "remotion": "latest",
+    "typescript": "latest"
+  },
+  "devDependencies": {
+    "@types/react": "latest",
+    "@types/react-dom": "latest"
+  }
+}

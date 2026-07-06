@@ -1,0 +1,20 @@
+[project]
+name = "langgraph-study"
+version = "0.1.0"
+description = "Multi-agent workflow study for AI hotspot discovery."
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+graph = ["graphviz", "langgraph==1.2.6"]
+server = ["fastapi", "uvicorn[standard]"]
+video = ["edge-tts", "imageio-ffmpeg", "pillow"]
+pdf = ["pypdf"]
+
+[tool.setuptools.packages.find]
+include = ["app*"]
+exclude = ["external*", "scripts*", "tests*"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"

@@ -20,6 +20,7 @@ try:
         _video_workspace_html,
         _rewrite_workspace_html,
         _allow_stale_candidate_rewrite,
+        _delete_previous_wechat_download_cache,
         _save_workflow_state_cache,
         _should_auto_start_ollama,
         _should_auto_start_wechat_download_api,
@@ -27,6 +28,7 @@ try:
         _state_from_candidate_snapshot,
         _summarize_state,
         _WORKFLOW_CACHE,
+        WORKFLOW_CACHE_FILE,
         _is_reference_image_too_small_error,
         _without_reference_image_args,
         _textbook_original_question_from_basis,
@@ -57,6 +59,7 @@ except ImportError:  # pragma: no cover - optional server extra may be absent lo
     _video_workspace_html = None
     _rewrite_workspace_html = None
     _allow_stale_candidate_rewrite = None
+    _delete_previous_wechat_download_cache = None
     _save_workflow_state_cache = None
     _should_auto_start_ollama = None
     _should_auto_start_wechat_download_api = None
@@ -64,6 +67,7 @@ except ImportError:  # pragma: no cover - optional server extra may be absent lo
     _state_from_candidate_snapshot = None
     _summarize_state = None
     _WORKFLOW_CACHE = None
+    WORKFLOW_CACHE_FILE = None
     _is_reference_image_too_small_error = None
     _without_reference_image_args = None
     _textbook_original_question_from_basis = None
@@ -247,9 +251,29 @@ class ServerTest(unittest.TestCase):
         self.assertIn("绿灯", html)
         self.assertIn("/workflow/rewrite/candidates", html)
         self.assertIn("/workflow/rewrite/selected", html)
+        self.assertIn("/workflow/rewrite/selected/stream", html)
+        self.assertIn("/workflow/rewrite/subscriptions/refresh/stream", html)
+        self.assertIn("手动更新订阅号文章", html)
+        self.assertIn("manualRefreshSubscriptions", html)
+        self.assertIn("refresh-progress", html)
+        self.assertIn("activeRefreshTimerId", html)
+        self.assertIn("updateRefreshElapsedProgress", html)
+        self.assertIn("stopRefreshElapsedProgress", html)
+        self.assertIn("rewrite-progress", html)
+        self.assertIn("activeRewriteTimerId", html)
+        self.assertIn("updateRewriteElapsedProgress", html)
+        self.assertIn("stopRewriteElapsedProgress", html)
+        self.assertIn("formatStreamError", html)
+        self.assertIn("改写流连接中断", html)
+        self.assertIn("handleRewriteStreamEvent", html)
+        self.assertIn("appendRewriteProgress", html)
+        self.assertIn("原文 ${sourceTextLength} 字", html)
+        self.assertIn("改写稿 ${rewriteTextLength} 字", html)
+        self.assertIn("总耗时 ${formatSeconds", html)
+        self.assertIn("已耗时", html)
         self.assertIn("candidatesById", html)
         self.assertIn("localStorage", html)
-        self.assertIn("langgraph-study:rewrite:candidates:v2", html)
+        self.assertIn("langgraph-study:rewrite:candidates:v3", html)
         self.assertIn("activeRewriteRequestId", html)
         self.assertIn("当前改写来源", html)
         self.assertIn("cache_only=${refresh ? \"false\" : \"true\"}", html)
@@ -278,6 +302,40 @@ class ServerTest(unittest.TestCase):
         self.assertIn("findImageSuggestionBlocks", html)
         self.assertIn("已继续显示浏览器本地缓存", html)
         self.assertIn("/workflow/rewrite/image", html)
+
+    def test_delete_previous_wechat_download_cache_keeps_today_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cache_dir = Path(temp_dir) / "wechat_article_lists"
+            cache_dir.mkdir()
+            yesterday_cache = cache_dir / "old.json"
+            today_cache = cache_dir / "today.json"
+            workflow_cache = Path(temp_dir) / "workflow_rewrite_state.json"
+            yesterday_cache.write_text(
+                json.dumps({"cached_at": "2026-07-07T10:00:00+00:00", "payload": {}}),
+                encoding="utf-8",
+            )
+            today_cache.write_text(
+                json.dumps({"cached_at": "2026-07-08T01:00:00+00:00", "payload": {}}),
+                encoding="utf-8",
+            )
+            workflow_cache.write_text(
+                json.dumps({"cached_at": "2026-07-07T10:00:00+00:00", "state": {}}),
+                encoding="utf-8",
+            )
+
+            with (
+                patch("app.server.ARTICLE_LIST_CACHE_DIR", cache_dir),
+                patch("app.server.WORKFLOW_CACHE_FILE", workflow_cache),
+            ):
+                result = _delete_previous_wechat_download_cache(
+                    now=datetime(2026, 7, 8, 12, 0, tzinfo=timezone.utc)
+                )
+
+            self.assertEqual(result["article_list_cache_deleted"], 1)
+            self.assertEqual(result["workflow_cache_deleted"], 1)
+            self.assertFalse(yesterday_cache.exists())
+            self.assertTrue(today_cache.exists())
+            self.assertFalse(workflow_cache.exists())
 
     def test_video_workspace_redirects_to_agent(self) -> None:
         html = _video_workspace_html()

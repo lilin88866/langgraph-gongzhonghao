@@ -8,6 +8,7 @@ import re
 import subprocess
 import sys
 import threading
+import time
 from queue import Empty, Queue
 from datetime import datetime, timedelta, timezone
 from html import escape
@@ -51,7 +52,12 @@ from app.schemas.hotspot import (
     VideoChannelScript,
 )
 from app.tools.video_render import StoryboardClip, render_remotion_timeline_draft, render_video_draft
-from app.tools.wechat_download_api import WechatDownloadApiClient, _is_excluded_account_name, _looks_like_wechat_fakeid
+from app.tools.wechat_download_api import (
+    ARTICLE_LIST_CACHE_DIR,
+    WechatDownloadApiClient,
+    _is_excluded_account_name,
+    _looks_like_wechat_fakeid,
+)
 
 load_dotenv()
 
@@ -323,6 +329,272 @@ def workflow_rewrite_candidates(refresh: bool = False, cache_only: bool = False)
     return {"items": rows, "summary": _summarize_state(state), "cached": not refresh}
 
 
+@app.post("/workflow/rewrite/subscriptions/refresh/stream")
+def workflow_rewrite_subscription_refresh_stream() -> StreamingResponse:
+    return StreamingResponse(
+        _stream_rewrite_subscription_refresh(),
+        media_type="application/x-ndjson; charset=utf-8",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+def _stream_rewrite_subscription_refresh():
+    def emit(event: str, **data: Any) -> str:
+        payload = {"event": event, **data}
+        message = payload.get("message")
+        if message:
+            print(f"[rewrite-subscription-refresh] {message}", flush=True)
+        return json.dumps(payload, ensure_ascii=False) + "\n"
+
+    started_at = time.monotonic()
+    yield emit("progress", message="开始手动更新订阅号文章...")
+
+    cleanup_started_at = time.monotonic()
+    cleanup = _delete_previous_wechat_download_cache()
+    yield emit(
+        "progress",
+        message=(
+            f"已清理前一天及更早的下载缓存，用时 {_format_elapsed(time.monotonic() - cleanup_started_at)}："
+            f"删除文章列表缓存 {cleanup['article_list_cache_deleted']} 个，"
+            f"删除候选缓存 {cleanup['workflow_cache_deleted']} 个。"
+        ),
+        cleanup=cleanup,
+    )
+
+    result_queue: Queue[tuple[str, Any]] = Queue()
+
+    def refresh() -> None:
+        try:
+            result_queue.put(("ok", _cached_workflow_state(refresh=True)))
+        except Exception as exc:  # pragma: no cover - exercised through stream output.
+            result_queue.put(("error", exc))
+
+    refresh_started_at = time.monotonic()
+    thread = threading.Thread(target=refresh, name="rewrite-subscription-refresh", daemon=True)
+    thread.start()
+    yield emit("progress", message="正在拉取订阅号文章并重建候选列表...", phase="fetching", elapsed_seconds=0)
+    while True:
+        try:
+            status, value = result_queue.get(timeout=1.0)
+            break
+        except Empty:
+            elapsed_seconds = time.monotonic() - refresh_started_at
+            yield emit(
+                "progress",
+                message=f"订阅号文章仍在拉取中，已耗时 {_format_elapsed(elapsed_seconds)}。",
+                phase="fetching",
+                elapsed_seconds=round(elapsed_seconds, 3),
+            )
+
+    refresh_elapsed = time.monotonic() - refresh_started_at
+    if status == "error":
+        yield emit("error", message=f"订阅号文章拉取失败，用时 {_format_elapsed(refresh_elapsed)}：{_clean_subprocess_error(value)}")
+        return
+
+    state = value
+    rows = _rewrite_candidates(state) if state is not None else []
+    total_elapsed = time.monotonic() - started_at
+    yield emit(
+        "done",
+        message=f"订阅号文章更新完成：候选 {len(rows)} 篇，拉取用时 {_format_elapsed(refresh_elapsed)}，总耗时 {_format_elapsed(total_elapsed)}。",
+        result={
+            "items": rows,
+            "summary": _summarize_state(state or {}),
+            "cached": False,
+            "elapsed_seconds": round(total_elapsed, 3),
+            "fetch_elapsed_seconds": round(refresh_elapsed, 3),
+            "cleanup": cleanup,
+        },
+    )
+
+
+def _stream_rewrite_selected(payload: dict[str, Any]):
+    def emit(event: str, **data: Any) -> str:
+        payload = {"event": event, **data}
+        message = payload.get("message")
+        if message:
+            print(f"[rewrite-selected] {message}", flush=True)
+        return json.dumps(payload, ensure_ascii=False) + "\n"
+
+    started_at = time.monotonic()
+    content_id = str(payload.get("content_id") or "")
+    if not content_id:
+        yield emit("error", message="missing content_id")
+        return
+
+    yield emit("progress", message="正在读取候选文章缓存...")
+    state = _cached_workflow_state(refresh=False)
+    states: list[tuple[HotspotState | None, str]] = [(state, "服务端候选缓存")]
+    if _allow_stale_candidate_rewrite():
+        states.append((_state_from_candidate_snapshot(payload.get("candidate")), "页面候选快照"))
+
+    for selected_state, state_label in states:
+        if selected_state is None:
+            continue
+        contents = {content.content_id: content for content in selected_state.get("normalized_contents", [])}
+        content = contents.get(content_id)
+        if content is None:
+            continue
+
+        title = content.title or "未命名文章"
+        initial_text_length = len(content.text or "")
+        yield emit(
+            "progress",
+            message=f"已命中{state_label}：准备改写《{title}》，当前缓存正文 {initial_text_length} 字。",
+            article_title=title,
+            source_text_length=initial_text_length,
+        )
+
+        try:
+            detail_started_at = time.monotonic()
+            content = yield from _run_with_stream_progress(
+                lambda: _enrich_content_detail(content),
+                emit=emit,
+                waiting_message=lambda elapsed: f"正在校验或补拉《{title}》全文，已耗时 {elapsed}。",
+                progress_phase="rewrite-detail",
+            )
+            detail_elapsed = time.monotonic() - detail_started_at
+            source_text_length = len(content.text or "")
+            source_images = _source_image_urls(content.raw_payload)
+            yield emit(
+                "progress",
+                message=(
+                    f"全文准备完成：《{content.title}》，正文 {source_text_length} 字，"
+                    f"原文图片 {len(source_images)} 张，用时 {_format_elapsed(detail_elapsed)}。"
+                ),
+                article_title=content.title,
+                source_text_length=source_text_length,
+                source_image_count=len(source_images),
+                elapsed_seconds=round(detail_elapsed, 3),
+            )
+
+            trend = TrendCluster(
+                trend_id=f"selected-{content.content_id}",
+                name=_selected_topic(content.title),
+                summary=f"用户选择的公众号热度文章：{content.title}",
+                content_ids=[content.content_id],
+                platforms=[content.platform],
+                hotness_score=_score_for_content(selected_state, content.content_id),
+                lifecycle="rising",
+                evidence=[content.content_id],
+            )
+            rewrite_state: HotspotState = {
+                "normalized_contents": [content],
+                "hotness_scores": [
+                    score for score in selected_state.get("hotness_scores", []) if score.content_id == content_id
+                ],
+                "trends": [trend],
+                "product_insights": [],
+            }
+
+            rewrite_started_at = time.monotonic()
+            yield emit("progress", message=f"正在调用 wechat-rewrite Agent 改写《{content.title}》...")
+            rewrite_update = yield from _run_with_stream_progress(
+                lambda: WechatArticleWritingAgent().invoke(rewrite_state),
+                emit=emit,
+                waiting_message=lambda elapsed: f"正在改写《{content.title}》，已耗时 {elapsed}。",
+                progress_phase="rewriting",
+            )
+            rewrite_elapsed = time.monotonic() - rewrite_started_at
+            article = rewrite_update.get("generated_article")
+            if article is None:
+                yield emit("error", message="改写 Agent 未返回文章。")
+                return
+            yield emit("progress", message=f"改写正文生成完成，用时 {_format_elapsed(rewrite_elapsed)}，正在做质量检查...")
+
+            review_started_at = time.monotonic()
+            review_state: HotspotState = {**rewrite_state, **rewrite_update}
+            review_update = QualityControlAgent().invoke(review_state)
+            review_elapsed = time.monotonic() - review_started_at
+            total_elapsed = time.monotonic() - started_at
+            rewrite_text_length = _plain_text_length(article.body_markdown)
+            source = {
+                "content_id": content.content_id,
+                "title": content.title,
+                "author": content.author,
+                "url": content.url,
+                "source_text_length": source_text_length,
+                "rewrite_text_length": rewrite_text_length,
+                "article_compliance": rewrite_update.get("article_compliance"),
+                "quality_flags": review_update.get("quality_flags", []),
+                "quality_info": review_update.get("quality_info", []),
+                "review_flags": review_update.get("review_flags", []),
+                "human_review_required": bool(review_update.get("human_review_required")),
+                "stage_timings": {
+                    "full_text_seconds": round(detail_elapsed, 3),
+                    "rewrite_seconds": round(rewrite_elapsed, 3),
+                    "quality_check_seconds": round(review_elapsed, 3),
+                    "total_seconds": round(total_elapsed, 3),
+                },
+            }
+            result = {
+                "ok": True,
+                "content_id": content_id,
+                "article": jsonable_encoder(article),
+                "article_html": _article_html(article.title, article.subtitle, article.body_markdown),
+                "source_images": source_images,
+                "source": source,
+                "human_review_required": bool(source.get("human_review_required")),
+                "review_flags": source.get("review_flags", []),
+                "quality_info": source.get("quality_info", []),
+            }
+            yield emit(
+                "done",
+                message=(
+                    f"改写完成：《{article.title}》，原文 {source_text_length} 字，"
+                    f"改写稿 {rewrite_text_length} 字，"
+                    f"全文 {_format_elapsed(detail_elapsed)}，改写 {_format_elapsed(rewrite_elapsed)}，"
+                    f"质检 {_format_elapsed(review_elapsed)}，总耗时 {_format_elapsed(total_elapsed)}。"
+                ),
+                result=result,
+            )
+            return
+        except Exception as exc:
+            yield emit("error", message=f"改写失败：{_clean_subprocess_error(exc)}")
+            return
+
+    yield emit("error", message=f"content not found: {content_id}. 请点击“重新拉取”刷新候选列表后再选择。")
+
+
+def _run_with_stream_progress(
+    operation: Callable[[], Any],
+    *,
+    emit: Callable[..., str],
+    waiting_message: Callable[[str], str],
+    progress_phase: str | None = None,
+) -> Any:
+    result_queue: Queue[tuple[str, Any]] = Queue()
+
+    def run() -> None:
+        try:
+            result_queue.put(("ok", operation()))
+        except Exception as exc:
+            result_queue.put(("error", exc))
+
+    started_at = time.monotonic()
+    threading.Thread(target=run, daemon=True).start()
+    while True:
+        try:
+            status, value = result_queue.get(timeout=1.0)
+            break
+        except Empty:
+            elapsed_seconds = time.monotonic() - started_at
+            payload: dict[str, Any] = {
+                "message": waiting_message(_format_elapsed(elapsed_seconds)),
+                "elapsed_seconds": round(elapsed_seconds, 3),
+            }
+            if progress_phase:
+                payload["phase"] = progress_phase
+            yield emit("progress", **payload)
+    if status == "error":
+        raise value
+    return value
+
+
+def _plain_text_length(text: str) -> int:
+    return len(re.sub(r"\s+", "", re.sub(r"<[^>]+>", "", text or "")))
+
+
 @app.post("/workflow/rewrite/selected")
 def workflow_rewrite_selected(payload: dict[str, Any]) -> dict[str, Any]:
     content_id = str(payload.get("content_id") or "")
@@ -348,6 +620,15 @@ def workflow_rewrite_selected(payload: dict[str, Any]) -> dict[str, Any]:
         "review_flags": source.get("review_flags", []),
         "quality_info": source.get("quality_info", []),
     }
+
+
+@app.post("/workflow/rewrite/selected/stream")
+def workflow_rewrite_selected_stream(payload: dict[str, Any]) -> StreamingResponse:
+    return StreamingResponse(
+        _stream_rewrite_selected(payload),
+        media_type="application/x-ndjson; charset=utf-8",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 @app.post("/workflow/rewrite/image")
@@ -2793,6 +3074,56 @@ def _save_workflow_state_cache(state: HotspotState, *, expires_at: datetime) -> 
         print(f"Failed to write workflow cache: {exc}", flush=True)
 
 
+def _delete_previous_wechat_download_cache(*, now: datetime | None = None) -> dict[str, int]:
+    now = now or datetime.now(timezone.utc)
+    today = now.date()
+    article_list_deleted = 0
+    if ARTICLE_LIST_CACHE_DIR.exists():
+        for path in ARTICLE_LIST_CACHE_DIR.glob("*.json"):
+            cached_at = _cached_at_from_json_file(path)
+            if cached_at is None or cached_at.date() < today:
+                if _delete_cache_file(path):
+                    article_list_deleted += 1
+
+    workflow_cache_deleted = 0
+    cached_at = _cached_at_from_json_file(WORKFLOW_CACHE_FILE)
+    if cached_at is None or cached_at.date() < today:
+        if _delete_cache_file(WORKFLOW_CACHE_FILE):
+            workflow_cache_deleted += 1
+    _WORKFLOW_CACHE["state"] = None
+    _WORKFLOW_CACHE["expires_at"] = None
+    return {
+        "article_list_cache_deleted": article_list_deleted,
+        "workflow_cache_deleted": workflow_cache_deleted,
+    }
+
+
+def _cached_at_from_json_file(path: Path) -> datetime | None:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return _parse_cached_datetime(payload.get("cached_at"))
+
+
+def _delete_cache_file(path: Path) -> bool:
+    try:
+        if not path.exists():
+            return False
+        path.unlink()
+        return True
+    except OSError:
+        return False
+
+
+def _format_elapsed(seconds: float) -> str:
+    total_seconds = max(0, int(seconds))
+    minutes, rest_seconds = divmod(total_seconds, 60)
+    if minutes <= 0:
+        return f"{rest_seconds}秒"
+    return f"{minutes}分{rest_seconds:02d}秒"
+
+
 def _load_workflow_state_cache(*, now: datetime | None = None, allow_expired: bool = False) -> HotspotState | None:
     now = now or datetime.now(timezone.utc)
     try:
@@ -3233,9 +3564,12 @@ def _rewrite_workspace_html() -> str:
       <section class="panel">
         <div class="actions">
           <h2 style="margin-right:auto;">热度公众号文章</h2>
+          <button id="manual-subscription-refresh-btn" onclick="manualRefreshSubscriptions()">手动更新订阅号文章</button>
           <button class="secondary" onclick="loadCandidates(true)">重新拉取</button>
         </div>
         <p id="status" class="muted">正在加载候选文章...</p>
+        <p class="muted">手动更新会先删除前一天及更早的下载缓存，并在下方实时显示清理和拉取已耗时。</p>
+        <ol id="refresh-progress" class="progress-list"></ol>
         <div class="table-wrap">
           <table>
             <thead>
@@ -3251,6 +3585,7 @@ def _rewrite_workspace_html() -> str:
       <section class="panel">
         <h2>选中文章改写结果</h2>
         <p id="rewrite-status" class="muted">请选择左侧一篇文章。</p>
+        <ol id="rewrite-progress" class="progress-list"></ol>
         <p id="image-status" class="muted">生成改写稿后，每条“配图建议”旁会出现图片生成图标。</p>
         <iframe id="article-frame" class="article-frame" title="改写结果"></iframe>
       </section>
@@ -3265,6 +3600,13 @@ def _rewrite_workspace_html() -> str:
     let currentArticleMarkdown = "";
     let currentSourceImages = [];
     let activeRewriteRequestId = 0;
+    let activeManualRefreshId = 0;
+    let activeRefreshTimerId = null;
+    let activeRefreshTimerStartMs = 0;
+    let activeRefreshTimerItem = null;
+    let activeRewriteTimerId = null;
+    let activeRewriteTimerStartMs = 0;
+    let activeRewriteTimerItem = null;
 
     async function loadCandidates(refresh = false) {
       const showedLocalCache = !refresh && renderCachedCandidates();
@@ -3308,6 +3650,109 @@ def _rewrite_workspace_html() -> str:
       } catch (error) {
         setStatus(`已显示缓存候选文章；后台刷新失败：${error}`);
       }
+    }
+
+    async function manualRefreshSubscriptions() {
+      const requestId = ++activeManualRefreshId;
+      const button = document.getElementById("manual-subscription-refresh-btn");
+      const list = document.getElementById("refresh-progress");
+      button.disabled = true;
+      stopRefreshElapsedProgress();
+      list.innerHTML = "";
+      setStatus("正在手动更新订阅号文章...");
+      try {
+        const response = await fetch("/workflow/rewrite/subscriptions/refresh/stream", { method: "POST" });
+        const contentType = response.headers.get("content-type") || "";
+        if (!response.ok) throw new Error(await response.text());
+        if (!contentType.includes("application/x-ndjson")) {
+          throw new Error(`接口返回非 JSON 流：${(await response.text()).slice(0, 160)}`);
+        }
+        if (!response.body) throw new Error("当前浏览器不支持流式读取响应");
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder("utf-8");
+        let buffer = "";
+        while (true) {
+          if (requestId !== activeManualRefreshId) {
+            await reader.cancel();
+            return;
+          }
+          const { value, done } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split("\\n");
+          buffer = lines.pop() || "";
+          for (const line of lines) {
+            if (line.trim()) handleManualRefreshEvent(JSON.parse(line));
+          }
+        }
+        if (buffer.trim()) handleManualRefreshEvent(JSON.parse(buffer));
+      } catch (error) {
+        setStatus(`手动更新订阅号文章失败：${error}`);
+        stopRefreshElapsedProgress();
+        appendRefreshProgress(`失败：${error}`);
+      } finally {
+        if (requestId === activeManualRefreshId) {
+          button.disabled = false;
+        }
+      }
+    }
+
+    function handleManualRefreshEvent(event) {
+      if (event.phase === "fetching") {
+        const elapsedSeconds = Number(event.elapsed_seconds) || 0;
+        const prefix = elapsedSeconds > 0
+          ? "订阅号文章仍在拉取中"
+          : "正在拉取订阅号文章并重建候选列表";
+        updateRefreshElapsedProgress(prefix, elapsedSeconds);
+        return;
+      }
+      stopRefreshElapsedProgress();
+      if (event.message) {
+        appendRefreshProgress(event.message);
+        setStatus(event.message);
+      }
+      if (event.event === "done" && event.result) {
+        const items = event.result.items || [];
+        renderCandidates(items);
+        if (items.length > 0) cacheCandidates({ items, summary: event.result.summary || {}, cached: false });
+      }
+      if (event.event === "error") {
+        throw new Error(event.message || "手动更新失败");
+      }
+    }
+
+    function appendRefreshProgress(message) {
+      const item = document.createElement("li");
+      item.textContent = message;
+      document.getElementById("refresh-progress").appendChild(item);
+    }
+
+    function updateRefreshElapsedProgress(prefix, elapsedSeconds) {
+      if (!activeRefreshTimerItem) {
+        activeRefreshTimerItem = document.createElement("li");
+        document.getElementById("refresh-progress").appendChild(activeRefreshTimerItem);
+      }
+      activeRefreshTimerStartMs = Date.now() - Math.max(0, Number(elapsedSeconds) || 0) * 1000;
+      const render = () => {
+        const elapsed = (Date.now() - activeRefreshTimerStartMs) / 1000;
+        const message = `${prefix}，已耗时 ${formatSeconds(elapsed)}。`;
+        activeRefreshTimerItem.textContent = message;
+        setStatus(message);
+      };
+      render();
+      if (activeRefreshTimerId) {
+        window.clearInterval(activeRefreshTimerId);
+      }
+      activeRefreshTimerId = window.setInterval(render, 500);
+    }
+
+    function stopRefreshElapsedProgress() {
+      if (activeRefreshTimerId) {
+        window.clearInterval(activeRefreshTimerId);
+        activeRefreshTimerId = null;
+      }
+      activeRefreshTimerItem = null;
+      activeRefreshTimerStartMs = 0;
     }
 
     async function fetchJson(url, options = {}) {
@@ -3389,31 +3834,139 @@ def _rewrite_workspace_html() -> str:
       if (row) row.classList.add("selected");
       currentArticleMarkdown = "";
       currentSourceImages = [];
-      document.getElementById("rewrite-status").textContent = "Agent 正在按 wechat-rewrite skill 改写...";
+      stopRewriteElapsedProgress();
+      document.getElementById("rewrite-progress").innerHTML = "";
+      document.getElementById("rewrite-status").textContent = "正在连接改写流式接口...";
       document.getElementById("image-status").textContent = "正在等待当前选中文章的改写结果...";
       document.getElementById("article-frame").srcdoc = "";
-      const response = await fetch("/workflow/rewrite/selected", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ content_id: contentId, candidate: candidatesById.get(contentId) || null }),
-      });
-      const data = await response.json();
-      if (requestId !== activeRewriteRequestId) {
+      try {
+        const response = await fetch("/workflow/rewrite/selected/stream", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ content_id: contentId, candidate: candidatesById.get(contentId) || null }),
+        });
+        const contentType = response.headers.get("content-type") || "";
+        if (!response.ok) throw new Error(await response.text());
+        if (!contentType.includes("application/x-ndjson")) {
+          throw new Error(`改写接口返回非 JSON 流：${(await response.text()).slice(0, 160)}`);
+        }
+        if (!response.body) throw new Error("当前浏览器不支持流式读取响应");
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder("utf-8");
+        let buffer = "";
+        while (true) {
+          if (requestId !== activeRewriteRequestId) {
+            await reader.cancel();
+            return;
+          }
+          const { value, done } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split("\\n");
+          buffer = lines.pop() || "";
+          for (const line of lines) {
+            if (line.trim()) handleRewriteStreamEvent(JSON.parse(line), requestId);
+          }
+        }
+        if (buffer.trim()) handleRewriteStreamEvent(JSON.parse(buffer), requestId);
+      } catch (error) {
+        if (requestId === activeRewriteRequestId) {
+          const message = formatStreamError(error);
+          document.getElementById("rewrite-status").textContent = message;
+          stopRewriteElapsedProgress();
+          appendRewriteProgress(message);
+        }
+      }
+    }
+
+    function handleRewriteStreamEvent(event, requestId) {
+      if (requestId !== activeRewriteRequestId) return;
+      if (event.phase === "rewrite-detail" || event.phase === "rewriting") {
+        updateRewriteElapsedProgress(event.message || "正在处理选中文章...", event.elapsed_seconds || 0);
         return;
       }
-      if (!data.ok) {
-        document.getElementById("rewrite-status").textContent = data.error || "改写失败";
-        return;
+      stopRewriteElapsedProgress();
+      if (event.message) {
+        appendRewriteProgress(event.message);
+        document.getElementById("rewrite-status").textContent = event.message;
       }
+      if (event.event === "error") {
+        throw new Error(event.message || "改写失败");
+      }
+      if (event.event === "done" && event.result) {
+        renderRewriteResult(event.result);
+      }
+    }
+
+    function appendRewriteProgress(message) {
+      const item = document.createElement("li");
+      item.textContent = message;
+      document.getElementById("rewrite-progress").appendChild(item);
+    }
+
+    function updateRewriteElapsedProgress(message, elapsedSeconds) {
+      if (!activeRewriteTimerItem) {
+        activeRewriteTimerItem = document.createElement("li");
+        document.getElementById("rewrite-progress").appendChild(activeRewriteTimerItem);
+      }
+      const prefix = String(message || "正在处理选中文章...").replace(/，已耗时\s*\d+分?\d*秒。?$/, "");
+      activeRewriteTimerStartMs = Date.now() - Math.max(0, Number(elapsedSeconds) || 0) * 1000;
+      const render = () => {
+        if (!activeRewriteTimerItem || !document.body.contains(activeRewriteTimerItem)) {
+          stopRewriteElapsedProgress();
+          return;
+        }
+        const elapsed = (Date.now() - activeRewriteTimerStartMs) / 1000;
+        const dynamicMessage = `${prefix}，已耗时 ${formatSeconds(elapsed)}。`;
+        activeRewriteTimerItem.textContent = dynamicMessage;
+        document.getElementById("rewrite-status").textContent = dynamicMessage;
+      };
+      render();
+      if (activeRewriteTimerId) {
+        window.clearInterval(activeRewriteTimerId);
+      }
+      activeRewriteTimerId = window.setInterval(render, 500);
+    }
+
+    function stopRewriteElapsedProgress() {
+      if (activeRewriteTimerId) {
+        window.clearInterval(activeRewriteTimerId);
+        activeRewriteTimerId = null;
+      }
+      activeRewriteTimerItem = null;
+      activeRewriteTimerStartMs = 0;
+    }
+
+    function formatStreamError(error) {
+      const text = String(error && (error.message || error) || "未知错误");
+      if (text.includes("Error in input stream")) {
+        return "改写流连接中断：开发服务可能正在重载或网络连接被中断，请重新点击“选择改写”。";
+      }
+      return `改写失败：${text}`;
+    }
+
+    function renderRewriteResult(data) {
       currentArticleMarkdown = data.article.body_markdown || "";
       currentSourceImages = Array.isArray(data.source_images) ? data.source_images : [];
       const sourceTitle = data.source && data.source.title ? data.source.title : data.article.title;
+      const sourceTextLength = data.source && Number.isFinite(Number(data.source.source_text_length)) ? Number(data.source.source_text_length) : 0;
+      const rewriteTextLength = data.source && Number.isFinite(Number(data.source.rewrite_text_length)) ? Number(data.source.rewrite_text_length) : 0;
+      const timings = data.source && data.source.stage_timings ? data.source.stage_timings : {};
       const tokenSummary = formatLlmUsage(data.article.llm_usage);
-      document.getElementById("rewrite-status").textContent = `已生成：${data.article.title}；当前改写来源：${sourceTitle}；${tokenSummary}`;
+      document.getElementById("rewrite-status").textContent = `已生成：${data.article.title}；当前改写来源：${sourceTitle}；原文 ${sourceTextLength} 字；改写稿 ${rewriteTextLength} 字；总耗时 ${formatSeconds(timings.total_seconds)}；${tokenSummary}`;
       document.getElementById("image-status").textContent = "正在识别正文中的配图建议...";
       const frame = document.getElementById("article-frame");
       frame.onload = () => enhanceImageSuggestions();
       frame.srcdoc = data.article_html;
+    }
+
+    function formatSeconds(seconds) {
+      if (seconds === undefined || seconds === null || Number.isNaN(Number(seconds))) return "未知";
+      const total = Math.max(0, Math.floor(Number(seconds)));
+      const minutes = Math.floor(total / 60);
+      const rest = total % 60;
+      if (minutes <= 0) return `${rest}秒`;
+      return `${minutes}分${String(rest).padStart(2, "0")}秒`;
     }
 
     function formatLlmUsage(usage) {

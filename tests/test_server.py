@@ -15,7 +15,10 @@ try:
         _image_negative_prompt,
         _image_prompt_from_text,
         _image_urls_from_output,
+        _knowledge_first_candidates,
         _rewrite_candidates,
+        _wechat_article_detail_payload,
+        _wechat_article_feed,
         _wechat_10w_hot_candidates,
         _enrich_content_detail_with_status,
         _rewrite_selected_article,
@@ -47,6 +50,9 @@ try:
         _ensure_china_textbook_pdf,
         _video_agent_source_html,
         workflow_rewrite_candidates,
+        workflow_rewrite_knowledge_candidates,
+        workflow_wechat_article_detail,
+        workflow_wechat_articles,
         workflow_rewrite_image,
         workflow_video_agent_run,
         workflow_video_render,
@@ -57,7 +63,10 @@ except ImportError:  # pragma: no cover - optional server extra may be absent lo
     _image_negative_prompt = None
     _image_prompt_from_text = None
     _image_urls_from_output = None
+    _knowledge_first_candidates = None
     _rewrite_candidates = None
+    _wechat_article_detail_payload = None
+    _wechat_article_feed = None
     _wechat_10w_hot_candidates = None
     _enrich_content_detail_with_status = None
     _rewrite_selected_article = None
@@ -89,6 +98,9 @@ except ImportError:  # pragma: no cover - optional server extra may be absent lo
     _ensure_china_textbook_pdf = None
     _video_agent_source_html = None
     workflow_rewrite_candidates = None
+    workflow_rewrite_knowledge_candidates = None
+    workflow_wechat_article_detail = None
+    workflow_wechat_articles = None
     workflow_rewrite_image = None
     workflow_video_agent_run = None
     workflow_video_render = None
@@ -228,6 +240,87 @@ class ServerTest(unittest.TestCase):
         self.assertEqual(candidates[0]["readiness"], "ready")
         self.assertEqual(candidates[0]["image_count"], 1)
 
+    def test_knowledge_first_candidates_prioritize_explainer_articles(self) -> None:
+        state = {
+            "normalized_contents": [
+                NormalizedContent(
+                    platform=Platform.WECHAT,
+                    content_id="news",
+                    author="科技快讯",
+                    title="某大模型公司发布新功能",
+                    text="这是一篇普通 AI 新闻快讯。" * 80,
+                    media_type=MediaType.ARTICLE,
+                    published_at=datetime(2026, 7, 9, 9, 0, tzinfo=timezone.utc),
+                    metrics=EngagementMetrics(reads=90000, likes=100),
+                    url="https://mp.weixin.qq.com/s/news",
+                    source_api="wechat-download-api",
+                    raw_payload={},
+                ),
+                NormalizedContent(
+                    platform=Platform.WECHAT,
+                    content_id="explainer",
+                    author="AI 知识号",
+                    title="ReAct、Plan-and-Execute、Reflection 三种 Agent 范式有什么核心区别？实际项目中如何选型？",
+                    text="本文详解 Agent 设计范式、核心逻辑、工程实践、常见误区和面试总结。" * 80,
+                    media_type=MediaType.ARTICLE,
+                    published_at=datetime(2026, 7, 9, 8, 0, tzinfo=timezone.utc),
+                    metrics=EngagementMetrics(reads=12000, likes=300),
+                    url="https://mp.weixin.qq.com/s/explainer",
+                    source_api="wechat-download-api",
+                    raw_payload={},
+                ),
+                NormalizedContent(
+                    platform=Platform.WECHAT,
+                    content_id="course",
+                    author="AI 学习号",
+                    title="AI Agent 实战训练营限时报名，扫码领取课程福利",
+                    text="直播公开课报名，扫码进群领取资料。" * 80,
+                    media_type=MediaType.ARTICLE,
+                    published_at=datetime(2026, 7, 9, 10, 0, tzinfo=timezone.utc),
+                    metrics=EngagementMetrics(reads=100000, likes=500),
+                    url="https://mp.weixin.qq.com/s/course",
+                    source_api="wechat-download-api",
+                    raw_payload={},
+                ),
+            ],
+            "hotness_scores": [
+                HotnessScore(
+                    content_id="news",
+                    hotness_score=90.0,
+                    velocity_score=0.0,
+                    engagement_quality_score=0.0,
+                    platform_weight=1.0,
+                    reason="高阅读新闻",
+                ),
+                HotnessScore(
+                    content_id="explainer",
+                    hotness_score=65.0,
+                    velocity_score=0.0,
+                    engagement_quality_score=0.0,
+                    platform_weight=1.0,
+                    reason="知识解释",
+                ),
+                HotnessScore(
+                    content_id="course",
+                    hotness_score=99.0,
+                    velocity_score=0.0,
+                    engagement_quality_score=0.0,
+                    platform_weight=1.0,
+                    reason="营销内容",
+                ),
+            ],
+        }
+
+        candidates = _knowledge_first_candidates(state, limit=3)
+        candidate_ids = [candidate["content_id"] for candidate in candidates]
+
+        self.assertEqual(candidates[0]["content_id"], "explainer")
+        self.assertIn(candidates[0]["knowledge_content_type"], {"对比型", "面试题型"})
+        self.assertGreater(candidates[0]["knowledge_content_score"], candidates[1]["knowledge_content_score"])
+        self.assertIn("核心区别", candidates[0]["structure_signals"])
+        self.assertIn("knowledge-first", candidates[0]["source"])
+        self.assertNotIn("course", candidate_ids)
+
     def test_image_text_evidence_is_appended_to_selected_content(self) -> None:
         content = NormalizedContent(
             platform=Platform.WECHAT,
@@ -285,6 +378,112 @@ class ServerTest(unittest.TestCase):
 
         self.assertEqual(_rewrite_candidates(state), [])
 
+    def test_rewrite_candidates_skip_missing_title_articles(self) -> None:
+        state = {
+            "normalized_contents": [
+                NormalizedContent(
+                    platform=Platform.WECHAT,
+                    content_id="missing-title",
+                    author="AI 公众号",
+                    title="",
+                    text="AI Agent 实践指南。" * 80,
+                    media_type=MediaType.ARTICLE,
+                    published_at=None,
+                    metrics=EngagementMetrics(reads=10000),
+                    url="https://mp.weixin.qq.com/s/missing-title",
+                    source_api="wechat-download-api",
+                    raw_payload={},
+                ),
+                NormalizedContent(
+                    platform=Platform.WECHAT,
+                    content_id="placeholder-title",
+                    author="AI 公众号",
+                    title="未命名文章",
+                    text="AI Agent 实践指南。" * 80,
+                    media_type=MediaType.ARTICLE,
+                    published_at=None,
+                    metrics=EngagementMetrics(reads=10000),
+                    url="https://mp.weixin.qq.com/s/placeholder-title",
+                    source_api="wechat-download-api",
+                    raw_payload={},
+                ),
+            ],
+            "hotness_scores": [
+                HotnessScore(
+                    content_id="missing-title",
+                    hotness_score=80.0,
+                    velocity_score=0.0,
+                    engagement_quality_score=0.0,
+                    platform_weight=1.0,
+                    reason="无标题",
+                ),
+                HotnessScore(
+                    content_id="placeholder-title",
+                    hotness_score=70.0,
+                    velocity_score=0.0,
+                    engagement_quality_score=0.0,
+                    platform_weight=1.0,
+                    reason="占位标题",
+                ),
+            ],
+        }
+
+        self.assertEqual(_rewrite_candidates(state), [])
+
+    def test_rewrite_candidates_skip_hollow_articles_but_keep_concrete_guides(self) -> None:
+        state = {
+            "normalized_contents": [
+                NormalizedContent(
+                    platform=Platform.WECHAT,
+                    content_id="hollow",
+                    author="AI 公众号",
+                    title="重磅！AI 风口来了，普通人必须抓住机会",
+                    text="未来已来，时代彻底变了，机会来了。" * 20,
+                    media_type=MediaType.ARTICLE,
+                    published_at=None,
+                    metrics=EngagementMetrics(reads=60000),
+                    url="https://mp.weixin.qq.com/s/hollow",
+                    source_api="wechat-download-api",
+                    raw_payload={},
+                ),
+                NormalizedContent(
+                    platform=Platform.WECHAT,
+                    content_id="guide",
+                    author="AI 公众号",
+                    title="普通人必须懂的 AI Agent 实践指南",
+                    text="本文拆解 Agent 工作流、工具调用、上下文管理和复核流程。" * 60,
+                    media_type=MediaType.ARTICLE,
+                    published_at=None,
+                    metrics=EngagementMetrics(reads=30000),
+                    url="https://mp.weixin.qq.com/s/guide",
+                    source_api="wechat-download-api",
+                    raw_payload={},
+                ),
+            ],
+            "hotness_scores": [
+                HotnessScore(
+                    content_id="hollow",
+                    hotness_score=95.0,
+                    velocity_score=0.0,
+                    engagement_quality_score=0.0,
+                    platform_weight=1.0,
+                    reason="空泛内容",
+                ),
+                HotnessScore(
+                    content_id="guide",
+                    hotness_score=40.0,
+                    velocity_score=0.0,
+                    engagement_quality_score=0.0,
+                    platform_weight=1.0,
+                    reason="具体教程",
+                ),
+            ],
+        }
+
+        candidates = _rewrite_candidates(state)
+
+        self.assertEqual([candidate["content_id"] for candidate in candidates], ["guide"])
+
     def test_rewrite_candidates_keep_missing_reads_unknown(self) -> None:
         state = {
             "normalized_contents": [
@@ -319,6 +518,96 @@ class ServerTest(unittest.TestCase):
         self.assertIsNone(candidate["reads"])
         self.assertIsNone(candidate["likes"])
         self.assertIsNone(candidate["comments"])
+        self.assertEqual(candidate["read_source"], "missing")
+        self.assertEqual(candidate["detail_status"], "ready")
+        self.assertGreater(candidate["text_length"], 0)
+        self.assertEqual(candidate["cache_source"], "workflow_rewrite_state")
+        self.assertIn("cache_cached_at", candidate)
+
+    def test_wechat_article_feed_sorts_by_publish_time(self) -> None:
+        state = {
+            "normalized_contents": [
+                NormalizedContent(
+                    platform=Platform.WECHAT,
+                    content_id="old",
+                    author="AI 公众号",
+                    title="昨天的 AI 文章",
+                    text="AI Agent 实践指南。" * 80,
+                    media_type=MediaType.ARTICLE,
+                    published_at=datetime(2026, 7, 8, 9, 0, tzinfo=timezone.utc),
+                    metrics=EngagementMetrics(reads=10000),
+                    url="https://mp.weixin.qq.com/s/old",
+                    source_api="wechat-download-api",
+                    raw_payload={},
+                ),
+                NormalizedContent(
+                    platform=Platform.WECHAT,
+                    content_id="new",
+                    author="AI 公众号",
+                    title="今天的 AI 文章",
+                    text="AI Agent 实践指南。" * 80,
+                    media_type=MediaType.ARTICLE,
+                    published_at=datetime(2026, 7, 9, 9, 0, tzinfo=timezone.utc),
+                    metrics=EngagementMetrics(reads=1000),
+                    url="https://mp.weixin.qq.com/s/new",
+                    source_api="wechat-download-api",
+                    raw_payload={},
+                ),
+            ],
+            "hotness_scores": [
+                HotnessScore(
+                    content_id="old",
+                    hotness_score=99.0,
+                    velocity_score=0.0,
+                    engagement_quality_score=0.0,
+                    platform_weight=1.0,
+                    reason="旧文高热",
+                ),
+                HotnessScore(
+                    content_id="new",
+                    hotness_score=20.0,
+                    velocity_score=0.0,
+                    engagement_quality_score=0.0,
+                    platform_weight=1.0,
+                    reason="新文",
+                ),
+            ],
+        }
+
+        feed = _wechat_article_feed(state, limit=2)
+
+        self.assertEqual([item["content_id"] for item in feed], ["new", "old"])
+        self.assertEqual(feed[0]["source"], "wechat-subscription-feed")
+        self.assertIn("发布时间", feed[0]["feed_reason"])
+
+    def test_wechat_article_detail_payload_previews_without_rewrite(self) -> None:
+        state = {
+            "normalized_contents": [
+                NormalizedContent(
+                    platform=Platform.WECHAT,
+                    content_id="content-1",
+                    author="AI 公众号",
+                    title="AI 详情文章",
+                    text="第一段。\n\n第二段。",
+                    media_type=MediaType.ARTICLE,
+                    published_at=datetime(2026, 7, 9, 9, 0, tzinfo=timezone.utc),
+                    metrics=EngagementMetrics(reads=1000),
+                    url="https://mp.weixin.qq.com/s/detail",
+                    source_api="wechat-download-api",
+                    raw_payload={"image_urls": ["https://mmbiz.qpic.cn/a.jpg"]},
+                )
+            ],
+            "hotness_scores": [],
+        }
+
+        detail = _wechat_article_detail_payload(state, "content-1", fetch_detail=False)
+
+        self.assertIsNotNone(detail)
+        assert detail is not None
+        self.assertEqual(detail["article"]["title"], "AI 详情文章")
+        self.assertIn("第一段", detail["text_preview"])
+        self.assertEqual(detail["source_images"], ["https://mmbiz.qpic.cn/a.jpg"])
+        self.assertEqual(detail["detail_status"]["status"], "missing")
 
     def test_wechat_10w_hot_candidates_rank_reads_then_ai_heat(self) -> None:
         state = {
@@ -463,8 +752,17 @@ class ServerTest(unittest.TestCase):
         self.assertIn("手动更新订阅号文章", html)
         self.assertIn("wechat-10w-hot 高热榜", html)
         self.assertIn("/workflow/rewrite/hot-candidates", html)
+        self.assertIn("/workflow/rewrite/knowledge-candidates", html)
         self.assertIn("loadHotCandidates", html)
+        self.assertIn("loadKnowledgeCandidates", html)
         self.assertIn("currentCandidateMode", html)
+        self.assertIn("知识型优先", html)
+        self.assertIn("knowledge_badge", html)
+        self.assertIn("knowledge_reason", html)
+        self.assertIn("knowledge_content_score", html)
+        self.assertIn("knowledge_content_type", html)
+        self.assertIn("structure_signals", html)
+        self.assertIn("marketing_signals", html)
         self.assertIn("hot_badge", html)
         self.assertIn("hot_reason", html)
         self.assertIn("manualRefreshSubscriptions", html)
@@ -990,6 +1288,20 @@ class ServerTest(unittest.TestCase):
         self.assertIsNone(content.metrics.comments)
         self.assertEqual(score.hotness_score, 66.5)
 
+    def test_state_from_candidate_snapshot_rejects_marketing_articles(self) -> None:
+        state = _state_from_candidate_snapshot(
+            {
+                "content_id": "marketing",
+                "title": "AI Agent 实战训练营限时报名",
+                "author": "AI 公众号",
+                "url": "https://mp.weixin.qq.com/s/marketing",
+                "reads": "10000",
+                "hotness_score": 90,
+            }
+        )
+
+        self.assertIsNone(state)
+
     def test_stale_candidate_rewrite_is_disabled_by_default(self) -> None:
         with patch.dict(os.environ, {}, clear=True):
             self.assertFalse(_allow_stale_candidate_rewrite())
@@ -1011,6 +1323,63 @@ class ServerTest(unittest.TestCase):
         self.assertEqual(result["items"], [])
         self.assertFalse(result["cached"])
         build_workflow.assert_not_called()
+
+    def test_cached_workflow_state_filters_marketing_articles_from_memory_cache(self) -> None:
+        _WORKFLOW_CACHE["state"] = {
+            "normalized_contents": [
+                NormalizedContent(
+                    platform=Platform.WECHAT,
+                    content_id="marketing",
+                    author="AI 公众号",
+                    title="AI Agent 实战训练营限时报名",
+                    text="直播公开课报名，扫码进群领取资料。" * 20,
+                    media_type=MediaType.ARTICLE,
+                    published_at=None,
+                    metrics=EngagementMetrics(reads=100000),
+                    url="https://mp.weixin.qq.com/s/marketing",
+                    source_api="wechat-download-api",
+                    raw_payload={},
+                ),
+                NormalizedContent(
+                    platform=Platform.WECHAT,
+                    content_id="guide",
+                    author="AI 公众号",
+                    title="AI Agent 工程实践指南",
+                    text="本文拆解 Agent 工具调用、RAG 流程和复核方法。" * 50,
+                    media_type=MediaType.ARTICLE,
+                    published_at=None,
+                    metrics=EngagementMetrics(reads=10000),
+                    url="https://mp.weixin.qq.com/s/guide",
+                    source_api="wechat-download-api",
+                    raw_payload={},
+                ),
+            ],
+            "hotness_scores": [
+                HotnessScore(
+                    content_id="marketing",
+                    hotness_score=99.0,
+                    velocity_score=0.0,
+                    engagement_quality_score=0.0,
+                    platform_weight=1.0,
+                    reason="营销",
+                ),
+                HotnessScore(
+                    content_id="guide",
+                    hotness_score=60.0,
+                    velocity_score=0.0,
+                    engagement_quality_score=0.0,
+                    platform_weight=1.0,
+                    reason="知识",
+                ),
+            ],
+        }
+        _WORKFLOW_CACHE["expires_at"] = datetime.now(timezone.utc) + timedelta(hours=1)
+        _WORKFLOW_CACHE["cached_at"] = datetime.now(timezone.utc)
+
+        result = workflow_wechat_articles(refresh=False, cache_only=True, limit=10)
+
+        self.assertEqual([item["content_id"] for item in result["items"]], ["guide"])
+        self.assertIn("rewrite_candidates_filtered_by_policy:1", result["summary"]["quality_info"])
 
     def test_rewrite_candidates_refresh_uses_candidate_workflow_without_article_generation(self) -> None:
         _WORKFLOW_CACHE["state"] = None
@@ -1062,6 +1431,92 @@ class ServerTest(unittest.TestCase):
         self.assertIn("wechat_accounts_discovered:1", result["summary"]["quality_info"])
         build_candidate.assert_called_once()
         build_full.assert_not_called()
+
+    def test_wechat_article_feed_endpoint_uses_cached_state(self) -> None:
+        state = {
+            "normalized_contents": [
+                NormalizedContent(
+                    platform=Platform.WECHAT,
+                    content_id="content-1",
+                    author="AI 公众号",
+                    title="今日订阅文章",
+                    text="AI Agent 实践指南。" * 80,
+                    media_type=MediaType.ARTICLE,
+                    published_at=datetime(2026, 7, 9, 9, 0, tzinfo=timezone.utc),
+                    metrics=EngagementMetrics(reads=1000),
+                    url="https://mp.weixin.qq.com/s/feed",
+                    source_api="wechat-download-api",
+                    raw_payload={},
+                )
+            ],
+            "hotness_scores": [],
+        }
+
+        with patch("app.server._cached_workflow_state", return_value=state) as cached_state:
+            result = workflow_wechat_articles(refresh=False, cache_only=True, limit=10)
+
+        self.assertEqual(result["source"], "wechat-subscription-feed")
+        self.assertEqual(result["items"][0]["title"], "今日订阅文章")
+        cached_state.assert_called_once_with(refresh=False, cache_only=True)
+
+    def test_knowledge_candidates_endpoint_uses_cached_state(self) -> None:
+        state = {
+            "normalized_contents": [
+                NormalizedContent(
+                    platform=Platform.WECHAT,
+                    content_id="content-1",
+                    author="AI 公众号",
+                    title="Agent 范式核心区别和实际项目选型指南",
+                    text="详解 ReAct、Plan-and-Execute、Reflection 的区别、原理和工程实践。" * 80,
+                    media_type=MediaType.ARTICLE,
+                    published_at=datetime(2026, 7, 9, 9, 0, tzinfo=timezone.utc),
+                    metrics=EngagementMetrics(reads=1000),
+                    url="https://mp.weixin.qq.com/s/knowledge",
+                    source_api="wechat-download-api",
+                    raw_payload={},
+                )
+            ],
+            "hotness_scores": [],
+        }
+
+        with patch("app.server._cached_workflow_state", return_value=state) as cached_state:
+            result = workflow_rewrite_knowledge_candidates(refresh=False, cache_only=True, limit=10)
+
+        self.assertEqual(result["source"], "knowledge-first")
+        self.assertEqual(result["items"][0]["title"], "Agent 范式核心区别和实际项目选型指南")
+        self.assertIn("knowledge_rank_note", result["summary"])
+        cached_state.assert_called_once_with(refresh=False, cache_only=True)
+
+    def test_wechat_article_detail_endpoint_does_not_rewrite(self) -> None:
+        state = {
+            "normalized_contents": [
+                NormalizedContent(
+                    platform=Platform.WECHAT,
+                    content_id="content-1",
+                    author="AI 公众号",
+                    title="详情预览文章",
+                    text="AI 正在进入具体工作流。",
+                    media_type=MediaType.ARTICLE,
+                    published_at=None,
+                    metrics=EngagementMetrics(reads=12000),
+                    url="https://mp.weixin.qq.com/s/detail-preview",
+                    source_api="wechat-download-api",
+                    raw_payload={},
+                )
+            ],
+            "hotness_scores": [],
+        }
+
+        with (
+            patch("app.server._cached_workflow_state", return_value=state),
+            patch("app.server.WechatArticleWritingAgent") as writing_agent,
+        ):
+            result = workflow_wechat_article_detail("content-1", fetch_detail=False)
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["article"]["title"], "详情预览文章")
+        self.assertIn("AI 正在进入具体工作流", result["text_preview"])
+        writing_agent.assert_not_called()
 
     def test_rewrite_candidates_cache_only_reads_server_file_cache(self) -> None:
         _WORKFLOW_CACHE["state"] = None

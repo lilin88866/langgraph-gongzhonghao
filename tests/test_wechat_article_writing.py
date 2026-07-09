@@ -3,7 +3,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from app.agents.wechat_article_writing import (
-    REWRITE_SIMILARITY_THRESHOLD,
+    REWRITE_SIMILARITY_MAX,
     WechatArticleWritingAgent,
     _compliance_report,
     _execute_rewrite_prompt,
@@ -85,7 +85,7 @@ class WechatArticleWritingAgentTest(unittest.TestCase):
         article = update["generated_article"]
         self.assertIn("article_compliance", update)
         self.assertIn("similarity", update["article_compliance"])
-        self.assertEqual(update["article_compliance"]["threshold"], REWRITE_SIMILARITY_THRESHOLD)
+        self.assertEqual(update["article_compliance"]["threshold"], REWRITE_SIMILARITY_MAX)
         self.assertIsNone(article.llm_usage)
         self.assertLessEqual(len(article.title), 20)
         self.assertIn("### 改写标题", article.body_markdown)
@@ -104,6 +104,9 @@ class WechatArticleWritingAgentTest(unittest.TestCase):
         self.assertIn("与原文相似度：", article.body_markdown)
         self.assertIn("合规判断：", article.body_markdown)
         self.assertIn("### wechat-rewrite 任务 Prompt", article.body_markdown)
+        self.assertIn("配图建议：", article.body_markdown)
+        self.assertIn("核心结构图", article.body_markdown)
+        self.assertIn("实践路径图", article.body_markdown)
         self.assertIn("智能体正在把资料整理和内容生成串成稳定流程。", article.rewrite_prompt)
         self.assertNotIn("<em", article.body_markdown)
         self.assertIn("用户需要稳定的自动化流程。", article.body_markdown)
@@ -229,6 +232,62 @@ class WechatArticleWritingAgentTest(unittest.TestCase):
         self.assertIn("你是 `langgraph-study` 的微信公众号改写 Agent", article.rewrite_prompt)
         self.assertIn("### 发布风险自查", article.rewrite_prompt)
 
+    def test_agent_prompt_sets_minimum_length_for_long_source(self) -> None:
+        long_text = "\n\n".join(
+            f"第{index}段：Agent 范式在工程实践中需要解释清楚目标、流程、成本、延迟和维护边界。"
+            for index in range(1, 80)
+        )
+        state = {
+            "normalized_contents": [
+                NormalizedContent(
+                    platform=Platform.WECHAT,
+                    content_id="long",
+                    author="AI 知识号",
+                    title="Agent 范式长文解析",
+                    text=long_text,
+                    media_type=MediaType.ARTICLE,
+                    published_at=None,
+                    metrics=EngagementMetrics(reads=1000),
+                    url="https://mp.weixin.qq.com/s/long",
+                    source_api="wechat-download-api",
+                    raw_payload={},
+                )
+            ],
+            "trends": [
+                TrendCluster(
+                    trend_id="selected-long",
+                    name="Agent 范式",
+                    summary="测试趋势",
+                    content_ids=["long"],
+                    platforms=[Platform.WECHAT],
+                    hotness_score=80.0,
+                    lifecycle="rising",
+                    evidence=["long"],
+                )
+            ],
+            "hotness_scores": [
+                HotnessScore(
+                    content_id="long",
+                    hotness_score=80.0,
+                    velocity_score=30.0,
+                    engagement_quality_score=20.0,
+                    platform_weight=1.0,
+                    reason="长文",
+                )
+            ],
+        }
+
+        article = WechatArticleWritingAgent().invoke(state)["generated_article"]
+
+        self.assertIn("原文正文长度约", article.rewrite_prompt)
+        self.assertIn("不得少于", article.rewrite_prompt)
+        self.assertIn("约为原文 70%", article.rewrite_prompt)
+        self.assertIn("原文关键信息展开", article.body_markdown)
+        self.assertIn("原文要点 1", article.body_markdown)
+        self.assertIn("第1段", article.body_markdown)
+        self.assertIn("配图建议：Agent 范式长文解析核心结构图", article.body_markdown)
+        self.assertIn("配图建议：Agent 范式长文解析实践路径图", article.body_markdown)
+
     def test_compliance_report_flags_high_similarity(self) -> None:
         source = NormalizedContent(
             platform=Platform.WECHAT,
@@ -248,7 +307,7 @@ class WechatArticleWritingAgentTest(unittest.TestCase):
 
         self.assertIn("与原文相似度：", report)
         self.assertIn("合规判断：需人工复核", report)
-        self.assertIn("相似度 ≤ 40%", report)
+        self.assertIn("目标相似度为 25%-30%", report)
 
     def test_execute_rewrite_prompt_falls_back_to_ollama_on_quota_error(self) -> None:
         primary = Mock()
@@ -264,6 +323,7 @@ class WechatArticleWritingAgentTest(unittest.TestCase):
         )
 
         with (
+            patch.dict(os.environ, {"QWEN_REWRITE_PREFER_LOCAL": "0"}),
             patch("app.agents.wechat_article_writing.QwenRewriteClient.from_env", return_value=primary),
             patch("app.agents.wechat_article_writing.QwenRewriteClient.fallback_from_env", return_value=fallback),
         ):
@@ -290,6 +350,7 @@ class WechatArticleWritingAgentTest(unittest.TestCase):
         )
 
         with (
+            patch.dict(os.environ, {"QWEN_REWRITE_PREFER_LOCAL": "0"}),
             patch("app.agents.wechat_article_writing.QwenRewriteClient.from_env", return_value=primary),
             patch("app.agents.wechat_article_writing.QwenRewriteClient.fallback_from_env", return_value=fallback),
         ):
@@ -301,6 +362,32 @@ class WechatArticleWritingAgentTest(unittest.TestCase):
         primary.rewrite_with_usage.assert_called_once_with("rewrite prompt")
         fallback.rewrite_with_usage.assert_called_once_with("rewrite prompt")
 
+    def test_execute_rewrite_prompt_prefers_local_fallback_by_default(self) -> None:
+        primary = Mock()
+        primary.model = "qwen-primary"
+        primary.base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1/"
+        fallback = Mock()
+        fallback.model = "qwen2.5:7b"
+        fallback.base_url = "http://localhost:11434/v1/"
+        fallback.rewrite_with_usage.return_value = QwenRewriteResult(
+            content="本地优先改写结果",
+            usage={"model": "qwen2.5:7b", "prompt_tokens": 10, "completion_tokens": 20, "total_tokens": 30},
+        )
+
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch("app.agents.wechat_article_writing.QwenRewriteClient.from_env", return_value=primary),
+            patch("app.agents.wechat_article_writing.QwenRewriteClient.fallback_from_env", return_value=fallback),
+        ):
+            result, usage = _execute_rewrite_prompt("rewrite prompt")
+
+        self.assertEqual(result, "本地优先改写结果")
+        assert usage is not None
+        self.assertEqual(usage["provider"], "fallback")
+        self.assertEqual(usage["base_url"], "http://localhost:11434/v1/")
+        fallback.rewrite_with_usage.assert_called_once_with("rewrite prompt")
+        primary.rewrite_with_usage.assert_not_called()
+
     def test_execute_rewrite_prompt_does_not_fallback_on_non_quota_error(self) -> None:
         primary = Mock()
         primary.model = "qwen-primary"
@@ -308,6 +395,7 @@ class WechatArticleWritingAgentTest(unittest.TestCase):
         primary.rewrite_with_usage.side_effect = RuntimeError("Qwen rewrite request failed: connection refused")
 
         with (
+            patch.dict(os.environ, {"QWEN_REWRITE_PREFER_LOCAL": "0"}),
             patch("app.agents.wechat_article_writing.QwenRewriteClient.from_env", return_value=primary),
             patch("app.agents.wechat_article_writing.QwenRewriteClient.fallback_from_env") as fallback_from_env,
         ):
@@ -319,7 +407,8 @@ class WechatArticleWritingAgentTest(unittest.TestCase):
         self.assertIn("connection refused", result)
         self.assertIsNone(usage["total_tokens"])
         self.assertIn("connection refused", usage["error"])
-        fallback_from_env.assert_not_called()
+        fallback_from_env.assert_called_once()
+        fallback_from_env.return_value.rewrite_with_usage.assert_not_called()
 
 
 if __name__ == "__main__":

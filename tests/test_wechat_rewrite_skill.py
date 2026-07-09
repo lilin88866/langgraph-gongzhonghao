@@ -64,12 +64,77 @@ class WechatRewriteSkillTest(unittest.TestCase):
         self.assertIn("### 配图建议", prompt)
         self.assertIn("### 发布风险自查", prompt)
         self.assertIn("保留原文的版式骨架", prompt)
-        self.assertIn("相似度尽量低于 30%", prompt)
+        self.assertIn("相似度目标区间是 25%-30%", prompt)
         self.assertIn("AI 知识型/讲解型订阅号", prompt)
         self.assertIn("是什么、为什么重要、普通人怎么理解", prompt)
         self.assertIn("配图占位卡片", prompt)
         self.assertIn("不要只在文末列配图建议", prompt)
+        self.assertIn("按正文长度估算插入 1 个", prompt)
+        self.assertIn("只汇总正文中已经插入的配图占位卡片", prompt)
+        self.assertIn("正文配图复核", prompt)
         self.assertIn("模型迁移工作流", prompt)
+
+    def test_build_task_prompt_uses_source_image_count(self) -> None:
+        skill = WechatRewriteSkill(
+            skill_dir=Path("/tmp/skill"),
+            rules="## 公众号\n规则",
+            keywords=["指南"],
+        )
+
+        prompt = skill.build_task_prompt(
+            {
+                "title": "Agent 图解",
+                "text": "Agent 工作流说明。",
+                "source_image_count": 4,
+            }
+        )
+
+        self.assertIn("原文检测到 4 张配图", prompt)
+        self.assertIn("必须对应插入 4 个“配图占位卡片”", prompt)
+        self.assertNotIn("直接插入 1-3 个", prompt)
+
+    def test_build_task_prompt_allows_no_inline_images_when_source_has_none(self) -> None:
+        skill = WechatRewriteSkill(
+            skill_dir=Path("/tmp/skill"),
+            rules="## 公众号\n规则",
+            keywords=["指南"],
+        )
+
+        prompt = skill.build_task_prompt(
+            {
+                "title": "Agent 纯文字解析",
+                "text": "Agent 工作流说明。",
+                "source_image_count": 0,
+            }
+        )
+
+        self.assertIn("原文未检测到正文配图", prompt)
+        self.assertIn("正文配图占位卡片可不插入", prompt)
+
+    def test_build_task_prompt_detects_images_from_raw_payload(self) -> None:
+        skill = WechatRewriteSkill(
+            skill_dir=Path("/tmp/skill"),
+            rules="## 公众号\n规则",
+            keywords=["指南"],
+        )
+
+        prompt = skill.build_task_prompt(
+            {
+                "title": "Agent 图解",
+                "text": "Agent 工作流说明。",
+                "raw_payload": {
+                    "article": {
+                        "image_urls": [
+                            "https://mmbiz.qpic.cn/one",
+                            "https://mmbiz.qpic.cn/two",
+                        ]
+                    }
+                },
+            }
+        )
+
+        self.assertIn("原文检测到 2 张配图", prompt)
+        self.assertIn("必须对应插入 2 个“配图占位卡片”", prompt)
 
     def test_default_loads_project_local_supporting_skills(self) -> None:
         with patch.dict(os.environ, {}, clear=True):

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 from difflib import SequenceMatcher
 from html import unescape
@@ -125,6 +126,7 @@ def _body_for(
 ) -> str:
     primary = evidence[0] if evidence else None
     source_title = _clean_text(primary.title if primary else trend.name)
+    source_raw_text = primary.text if primary else ""
     source_text = _clean_text(primary.text if primary else "")
     source_author = _clean_text(primary.author if primary and primary.author else "")
     source_url = primary.url if primary else None
@@ -151,6 +153,19 @@ def _body_for(
     hypothesis = insight.validation_hypothesis if insight else f"如果“{trend.name}”持续升温，值得进一步验证真实需求。"
     keyword_line = "、".join(skill.choose_keywords(f"{source_title}\n{source_text}\n{source_summary}"))
     tags = " ".join(f"#{tag}" for tag in skill.tags_for(source_title or trend.name, f"{source_text}\n{source_summary}"))
+    source_key_sections = _source_key_sections_html(source_raw_text)
+    concept_image_card = _inline_image_suggestion_card(
+        title=f"{_selected_image_topic(source_title or trend.name)}核心结构图",
+        position="放在“核心概念”段落后，用来承接原文关键信息展开。",
+        scene="把原文里的核心对象、关系、流程和边界整理成一张信息图，帮助读者先建立整体框架。",
+        usage="帮助读者快速理解这篇知识型文章到底在解释什么。",
+    )
+    workflow_image_card = _inline_image_suggestion_card(
+        title=f"{_selected_image_topic(source_title or trend.name)}实践路径图",
+        position="放在“怎么实际使用”步骤列表后，用来解释方法如何落地。",
+        scene="用流程箭头展示从理解概念、拆解步骤、设置边界到复核输出的完整路径。",
+        usage="帮助读者把文章里的方法迁移到自己的 AI 工作流。",
+    )
 
     return f"""### 改写标题
 
@@ -182,9 +197,15 @@ def _body_for(
 
 <p>{source_summary}</p>
 
+{concept_image_card}
+
+{source_key_sections}
+
 <h2>怎么实际使用：可以照着做的步骤</h2>
 
 {_html_list(practical_steps)}
+
+{workflow_image_card}
 
 <p>这背后的逻辑很简单：不要只给 AI 一个模糊目标，而要给它角色、边界、步骤、输出格式和检查标准。</p>
 
@@ -318,14 +339,45 @@ def _char_ngrams(value: str, size: int = 3) -> set[str]:
 
 def _execute_rewrite_prompt(prompt: str) -> tuple[str | None, dict[str, Any] | None]:
     client = QwenRewriteClient.from_env()
+    fallback = QwenRewriteClient.fallback_from_env()
+    if _prefer_local_rewrite() and fallback is not None:
+        try:
+            result = fallback.rewrite_with_usage(prompt)
+            return result.content, _usage_payload(result.usage, client=fallback, provider="fallback")
+        except RuntimeError as fallback_exc:
+            if client is None:
+                return f"""### 改写状态
+
+本地 Ollama 改写调用失败：{_clean_text(str(fallback_exc))}
+
+### wechat-rewrite 任务 Prompt
+
+```text
+{prompt}
+```
+""", _usage_error_payload(client=fallback, provider="fallback", error=str(fallback_exc))
     if client is None:
-        return None, None
+        if fallback is None:
+            return None, None
+        try:
+            result = fallback.rewrite_with_usage(prompt)
+            return result.content, _usage_payload(result.usage, client=fallback, provider="fallback")
+        except RuntimeError as fallback_exc:
+            return f"""### 改写状态
+
+本地 Ollama 改写调用失败：{_clean_text(str(fallback_exc))}
+
+### wechat-rewrite 任务 Prompt
+
+```text
+{prompt}
+```
+""", _usage_error_payload(client=fallback, provider="fallback", error=str(fallback_exc))
     try:
         result = client.rewrite_with_usage(prompt)
         return result.content, _usage_payload(result.usage, client=client, provider="primary")
     except RuntimeError as exc:
         if is_quota_error(str(exc)) or is_timeout_error(str(exc)):
-            fallback = QwenRewriteClient.fallback_from_env()
             if fallback is not None:
                 try:
                     result = fallback.rewrite_with_usage(prompt)
@@ -351,6 +403,10 @@ Qwen 改写调用失败：{_clean_text(str(exc))}
 {prompt}
 ```
 """, _usage_error_payload(client=client, provider="primary", error=str(exc))
+
+
+def _prefer_local_rewrite() -> bool:
+    return os.getenv("QWEN_REWRITE_PREFER_LOCAL", "1").lower() not in {"0", "false", "no"}
 
 
 def _usage_payload(usage: dict[str, Any], *, client: QwenRewriteClient, provider: str) -> dict[str, Any]:
@@ -442,6 +498,7 @@ def _rewrite_prompt_for(
             "author": primary.author,
             "url": primary.url,
             "metrics": metrics,
+            "raw_payload": primary.raw_payload,
         }
     )
 
@@ -490,6 +547,78 @@ def _caution_items_for(title: str, text: str) -> list[str]:
         "不要把热点写成空泛感想，要落到方法。",
         "不要删除来源依据，发布前至少自己确认一遍事实边界。",
     ]
+
+
+def _source_key_sections_html(source_text: str | None) -> str:
+    paragraphs = _source_key_paragraphs(source_text)
+    if not paragraphs:
+        return ""
+    body = "\n".join(
+        f"<p><strong>原文要点 {index}：</strong>{_clean_text(paragraph)}</p>"
+        for index, paragraph in enumerate(paragraphs, start=1)
+    )
+    return f"""<h2>原文关键信息展开</h2>
+
+<p>为了避免把长文压缩成短摘要，下面按原文顺序保留主要信息块，并用更适合公众号阅读的表达重新组织。</p>
+
+{body}"""
+
+
+def _source_key_paragraphs(source_text: str | None, *, max_items: int = 8, limit: int = 260) -> list[str]:
+    raw = re.sub(r"<[^>]+>", "\n", unescape(source_text or ""))
+    candidates = [item.strip() for item in re.split(r"\n{2,}|\r\n{2,}", raw) if item.strip()]
+    if len(candidates) <= 1:
+        sentences = re.split(r"(?<=[。！？!?])\s*", _clean_text(raw))
+        candidates = []
+        buffer = ""
+        for sentence in sentences:
+            if not sentence:
+                continue
+            if len(buffer) + len(sentence) < 180:
+                buffer += sentence
+                continue
+            if buffer:
+                candidates.append(buffer)
+            buffer = sentence
+        if buffer:
+            candidates.append(buffer)
+
+    result: list[str] = []
+    seen: set[str] = set()
+    for paragraph in candidates:
+        cleaned = _clean_text(paragraph)
+        if len(cleaned) < 24:
+            continue
+        clipped = _clip(cleaned, limit)
+        key = clipped[:40]
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(clipped)
+        if len(result) >= max_items:
+            break
+    return result
+
+
+def _inline_image_suggestion_card(*, title: str, position: str, scene: str, usage: str) -> str:
+    return f"""<section style="margin:18px 0; padding:14px 16px; border-radius:12px; background:#f8fafc; border:1px dashed #93c5fd;">
+  <p style="margin:0 0 8px; font-weight:700; color:#1d4ed8;">配图建议：{_clean_text(title)}</p>
+  <ul style="margin:0; padding-left:18px; color:#374151;">
+    <li>位置：{_clean_text(position)}</li>
+    <li>画面：{_clean_text(scene)}</li>
+    <li>用途：{_clean_text(usage)}</li>
+    <li>版权：建议重新绘制，不使用公司 Logo、真实截图或受版权保护元素。</li>
+  </ul>
+</section>"""
+
+
+def _selected_image_topic(title: str) -> str:
+    cleaned = _clean_text(title)
+    if not cleaned:
+        return "AI 知识"
+    if len(cleaned) <= 12:
+        return cleaned
+    return cleaned[:12]
 
 
 def _html_list(items: list[str]) -> str:

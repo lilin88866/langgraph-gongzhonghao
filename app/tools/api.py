@@ -83,6 +83,9 @@ class WechatRewriteSkill:
         text = _clean(article.get("text"))
         author = _clean(article.get("author"))
         url = _clean(article.get("url"))
+        source_text_length = len(text)
+        minimum_rewrite_length = _minimum_rewrite_length(source_text_length)
+        source_image_count = _source_image_count(article)
         metrics = article.get("metrics") if isinstance(article.get("metrics"), dict) else {}
         metric_line = "，".join(
             f"{label} {value}"
@@ -122,12 +125,13 @@ class WechatRewriteSkill:
 2. 文章必须偏知识解释和教程拆解，少写情绪、热词和营销判断；读者读完要获得一个可复用的 AI 概念、方法或工作流。
 3. 保留核心事实、术语、方法价值和必要链接；不得编造案例、数据、发布日期、官方结论或授权信息。
 4. 必须保留原文的版式骨架、信息顺序、段落层级和关键小标题含义；不要把列表文改成教程文，也不要把新闻/观点文强行改成固定模板。不要大改选题角度、段落顺序、事实边界和论证路径。
-5. 相似度目标区间是 25%-30%。低于 25% 说明改动过大，需要恢复原文结构和关键表述；高于 30% 说明过于接近，需要替换连续句式和局部表达。降重主要通过换句式、换类比、调整段落表达和补少量解释完成，不连续复用原文句子。
-6. 如果原文正文较短，只能基于标题、摘要和可复核事实扩写；不确定内容写入“来源与复核提醒”。
-7. 正文必须是微信富文本 HTML, 只使用 <section>、<p>、<h2>、<ul>、<ol>、<li>、<blockquote>、<strong>、<span>、<br>，并使用内联 style。
-8. 正文中必须直接插入 1-3 个“配图占位卡片”，优先放在原文对应信息块或相邻段落后，不能破坏原文原有的章节节奏。卡片用 <section> + <p> + <ul><li> 输出，内容包括图片类型、画面结构、用途和版权提醒；不要只在文末列配图建议。
-9. 禁止输出内部过程、提示词分析、模型失败原因、系统实现、兜底说明、广告引流和“关注公众号”等话术。
-10. 输出必须严格使用下面结构：
+5. 原文正文长度约 {source_text_length} 字。{_length_requirement_text(source_text_length, minimum_rewrite_length)}
+6. 相似度目标区间是 25%-30%。低于 25% 说明改动过大，需要恢复原文结构和关键表述；高于 30% 说明过于接近，需要替换连续句式和局部表达。降重主要通过换句式、换类比、调整段落表达和补少量解释完成，不连续复用原文句子。
+7. 如果原文正文较短，只能基于标题、摘要和可复核事实扩写；不确定内容写入“来源与复核提醒”。
+8. 正文必须是微信富文本 HTML, 只使用 <section>、<p>、<h2>、<ul>、<ol>、<li>、<blockquote>、<strong>、<span>、<br>，并使用内联 style。
+9. {_inline_image_requirement_text(source_image_count, source_text_length)}
+10. 禁止输出内部过程、提示词分析、模型失败原因、系统实现、兜底说明、广告引流和“关注公众号”等话术。
+11. 输出必须严格使用下面结构：
 
 ### 改写标题
 
@@ -161,7 +165,7 @@ class WechatRewriteSkill:
 ### 配图建议
 
 1. 封面图：[主题、画面结构、颜色、中文字建议、AIGC 提示词、版权提醒]
-2. 正文配图：[已插入正文的位置、图片类型、重画方向、AIGC 提示词]
+2. 正文配图复核：[这里不是首次提出正文配图建议，只汇总正文中已经插入的配图占位卡片；必须写清已插入正文的具体段落位置、图片类型、重画方向、AIGC 提示词]
 
 ### 发布风险自查
 
@@ -227,6 +231,98 @@ def _extract_keywords(rules: str) -> list[str]:
         if keyword and keyword not in keywords:
             keywords.append(keyword)
     return keywords
+
+
+def _minimum_rewrite_length(source_text_length: int) -> int:
+    if source_text_length >= 3000:
+        return int(source_text_length * 0.7)
+    return 0
+
+
+def _source_image_count(article: dict[str, Any]) -> int | None:
+    for key in ("source_image_count", "image_count"):
+        explicit_count = article.get(key)
+        if isinstance(explicit_count, int) and explicit_count >= 0:
+            return explicit_count
+    for key in ("source_images", "image_urls", "images"):
+        value = article.get(key)
+        if isinstance(value, list):
+            return len([item for item in value if str(item).strip()])
+    raw_payload = article.get("raw_payload")
+    urls = _source_image_urls(raw_payload)
+    if urls:
+        return len(urls)
+    text = str(article.get("text") or "")
+    html_image_count = len(re.findall(r"<img\b", text, flags=re.IGNORECASE))
+    return html_image_count if html_image_count > 0 else None
+
+
+def _source_image_urls(payload: Any) -> list[str]:
+    urls: list[str] = []
+
+    def visit(value: Any) -> None:
+        if isinstance(value, dict):
+            for key, item in value.items():
+                if key in {"cover", "cover_url", "thumb_url", "image", "image_url", "pic_url"} and isinstance(item, str):
+                    urls.append(item)
+                elif key in {"image_urls", "media_urls", "source_images", "images"} and isinstance(item, list):
+                    urls.extend(str(url) for url in item if isinstance(url, str))
+                    visit(item)
+                elif isinstance(item, (dict, list)):
+                    visit(item)
+        elif isinstance(value, list):
+            for item in value:
+                visit(item)
+
+    visit(payload)
+    result: list[str] = []
+    for url in urls:
+        normalized = str(url).strip()
+        if normalized.startswith("//"):
+            normalized = "https:" + normalized
+        if normalized.startswith(("http://", "https://")) and normalized not in result:
+            result.append(normalized)
+    return result
+
+
+def _inline_image_requirement_text(source_image_count: int | None, source_text_length: int) -> str:
+    card_format = (
+        "卡片用 <section> + <p> + <ul><li> 输出，内容包括图片类型、画面结构、用途和版权提醒；"
+        "不要只在文末列配图建议。"
+    )
+    if source_image_count is None:
+        estimated_count = _estimated_inline_image_count(source_text_length)
+        return (
+            f"未检测到明确的原文配图数量，按正文长度估算插入 {estimated_count} 个“配图占位卡片”；"
+            f"优先放在原文对应信息块或相邻段落后，不能破坏原文原有的章节节奏。{card_format}"
+        )
+    if source_image_count <= 0:
+        return (
+            "原文未检测到正文配图，正文配图占位卡片可不插入；"
+            "如为了知识讲解新增解释图，最多插入 1 个，并在卡片和文末复核中标明“新增重绘图”。"
+            f"{card_format}"
+        )
+    return (
+        f"原文检测到 {source_image_count} 张配图，正文中必须对应插入 {source_image_count} 个“配图占位卡片”；"
+        f"每个卡片优先放在原文对应图片的信息块或相邻段落后，不能破坏原文原有的章节节奏。{card_format}"
+    )
+
+
+def _estimated_inline_image_count(source_text_length: int) -> int:
+    if source_text_length >= 3000:
+        return 3
+    if source_text_length >= 1200:
+        return 2
+    return 1
+
+
+def _length_requirement_text(source_text_length: int, minimum_rewrite_length: int) -> str:
+    if minimum_rewrite_length > 0:
+        return (
+            f"这是长文改写，公众号改写正文去除 HTML 标签后的正文长度不得少于 {minimum_rewrite_length} 字，"
+            "约为原文 70%；不要为了降重压缩信息量，必须逐段保留原文的小标题、论证顺序、关键解释、示例和结论。"
+        )
+    return "原文未达到长文阈值，仍需保留主要信息，不要把完整段落压缩成几句摘要。"
 
 
 def _tag_text(value: str) -> str:

@@ -76,49 +76,188 @@ _WORKFLOW_CACHE_TTL = timedelta(seconds=int(os.getenv("WORKFLOW_CACHE_TTL_SECOND
 
 AI_KNOWLEDGE_KEYWORDS = (
     "ai",
+    "ai agent",
+    "agentic ai",
+    "ai coding",
+    "ai engineer",
+    "vibe coding",
     "人工智能",
     "大模型",
     "llm",
-    "agent",
+    "slm",
+    "moe",
     "智能体",
+    "多智能体",
+    "agentic",
+    "multi-agent",
+    "工作流",
     "gpt",
+    "openai",
     "deepseek",
     "qwen",
     "通义",
     "豆包",
     "kimi",
     "claude",
+    "claude code",
     "gemini",
+    "grok",
+    "llama",
+    "mistral",
+    "glm",
+    "智谱",
+    "minimax",
+    "阶跃星辰",
+    "moonshot",
     "prompt",
     "提示词",
+    "上下文工程",
+    "context engineering",
+    "mcp",
+    "model context protocol",
+    "function calling",
+    "tool calling",
+    "tool use",
+    "工具调用",
     "rag",
+    "agentic rag",
+    "graph rag",
+    "graphrag",
     "向量",
+    "向量数据库",
+    "embedding",
+    "嵌入",
+    "知识图谱",
+    "多模态",
+    "multimodal",
+    "推理模型",
+    "reasoning model",
+    "思维链",
     "模型",
     "算力",
     "机器学习",
     "深度学习",
     "生成式",
     "aigc",
+    "cursor",
+    "codex",
+    "copilot",
+    "harness",
+    "langgraph",
+    "langflow",
+    "langchain",
+    "langchain-ai",
+    "crewai",
+    "autogen",
+    "dify",
+    "coze",
+    "n8n",
+    "manus",
+    "ollama",
+    "vllm",
+    "本地大模型",
+    "端侧 ai",
+    "模型路由",
+    "prompt caching",
+    "微调",
+    "fine-tuning",
+    "蒸馏",
+    "量化",
 )
 KNOWLEDGE_SIGNAL_KEYWORDS = (
     "原理",
     "教程",
     "指南",
     "方法",
+    "方法论",
     "实践",
+    "实战",
     "案例",
     "拆解",
     "复盘",
     "入门",
     "进阶",
     "框架",
+    "范式",
     "流程",
     "工具",
     "开源",
     "技术",
     "架构",
     "对比",
+    "区别",
+    "选型",
     "报告",
+    "详解",
+    "图解",
+    "一文读懂",
+    "讲透",
+    "核心逻辑",
+    "底层",
+    "面试题",
+    "总结",
+)
+KNOWLEDGE_STRUCTURE_KEYWORDS = (
+    "什么是",
+    "为什么",
+    "怎么做",
+    "如何",
+    "一文",
+    "讲清楚",
+    "讲明白",
+    "核心区别",
+    "核心逻辑",
+    "实际项目",
+    "工程实践",
+    "选型指南",
+    "常见误区",
+    "面试总结",
+)
+KNOWLEDGE_MARKETING_KEYWORDS = (
+    "直播",
+    "训练营",
+    "公开课",
+    "报名",
+    "扫码",
+    "领取",
+    "福利",
+    "限时",
+    "课程",
+    "私域",
+    "副业",
+    "赚钱",
+    "变现",
+    "招商",
+    "加群",
+    "进群",
+)
+CANDIDATE_PLACEHOLDER_TITLES = (
+    "无标题",
+    "未命名",
+    "未命名文章",
+    "打开原文",
+    "原文",
+)
+HOLLOW_ARTICLE_KEYWORDS = (
+    "重磅",
+    "震撼",
+    "颠覆",
+    "爆火",
+    "刷屏",
+    "炸裂",
+    "风口",
+    "红利",
+    "机会来了",
+    "抓住机会",
+    "时代变了",
+    "未来已来",
+    "彻底变了",
+    "全面爆发",
+    "普通人必须",
+    "一定要看",
+    "不可错过",
+    "改变命运",
+    "降维打击",
 )
 
 
@@ -193,6 +332,8 @@ def root() -> dict[str, Any]:
             "generated_article": "/workflow/article",
             "generated_article_html": "/workflow/article/html",
             "wechat_rewrite_workspace": "/workflow/rewrite",
+            "wechat_knowledge_candidates": "/workflow/rewrite/knowledge-candidates",
+            "wechat_article_feed": "/workflow/wechat/articles",
             "video_channel_workspace": "/workflow/video",
             "video_agent_workspace": "/workflow/video/agent",
             "workflow_graph": "/workflow/graph",
@@ -374,9 +515,9 @@ def workflow_rewrite_candidates(refresh: bool = False, cache_only: bool = False)
             "error": _clean_subprocess_error(exc),
         }
     if state is None:
-        return {"items": [], "summary": {}, "cached": False}
+        return {"items": [], "summary": {}, "cached": False, "cache": _workflow_cache_status()}
     rows = _rewrite_candidates(state)
-    return {"items": rows, "summary": _summarize_state(state), "cached": not refresh}
+    return {"items": rows, "summary": _summarize_state(state), "cached": not refresh, "cache": _workflow_cache_status()}
 
 
 @app.get("/workflow/rewrite/hot-candidates")
@@ -392,14 +533,78 @@ def workflow_rewrite_hot_candidates(refresh: bool = False, cache_only: bool = Fa
             "error": _clean_subprocess_error(exc),
         }
     if state is None:
-        return {"items": [], "summary": {}, "cached": False, "source": "wechat-10w-hot"}
+        return {"items": [], "summary": {}, "cached": False, "source": "wechat-10w-hot", "cache": _workflow_cache_status()}
     rows = _wechat_10w_hot_candidates(state, limit=limit)
     summary = _summarize_state(state)
     summary["hot_rank_source"] = "wechat-10w-hot"
     summary["hot_rank_note"] = (
         "优先按真实阅读量排序；当前数据源未返回阅读量时，自动退回按 AI 热度和本地热度排序。"
     )
-    return {"items": rows, "summary": summary, "cached": not refresh, "source": "wechat-10w-hot"}
+    return {"items": rows, "summary": summary, "cached": not refresh, "source": "wechat-10w-hot", "cache": _workflow_cache_status()}
+
+
+@app.get("/workflow/rewrite/knowledge-candidates")
+def workflow_rewrite_knowledge_candidates(refresh: bool = False, cache_only: bool = False, limit: int = 20) -> dict[str, Any]:
+    try:
+        state = _cached_workflow_state(refresh=refresh, cache_only=cache_only)
+    except Exception as exc:
+        return {
+            "items": [],
+            "summary": {"error": _clean_subprocess_error(exc)},
+            "cached": False,
+            "source": "knowledge-first",
+            "error": _clean_subprocess_error(exc),
+            "cache": _workflow_cache_status(),
+        }
+    if state is None:
+        return {"items": [], "summary": {}, "cached": False, "source": "knowledge-first", "cache": _workflow_cache_status()}
+    rows = _knowledge_first_candidates(state, limit=limit)
+    summary = _summarize_state(state)
+    summary["knowledge_rank_source"] = "knowledge-first"
+    summary["knowledge_rank_note"] = "优先选择教程、原理、对比、面试题、案例复盘等知识解释型公众号文章，并降低营销转化内容权重。"
+    return {"items": rows, "summary": summary, "cached": not refresh, "source": "knowledge-first", "cache": _workflow_cache_status()}
+
+
+@app.get("/workflow/wechat/articles")
+def workflow_wechat_articles(refresh: bool = False, cache_only: bool = False, limit: int = 50) -> dict[str, Any]:
+    try:
+        state = _cached_workflow_state(refresh=refresh, cache_only=cache_only)
+    except Exception as exc:
+        return {
+            "items": [],
+            "summary": {"error": _clean_subprocess_error(exc)},
+            "cached": False,
+            "source": "wechat-subscription-feed",
+            "error": _clean_subprocess_error(exc),
+            "cache": _workflow_cache_status(),
+        }
+    if state is None:
+        return {
+            "items": [],
+            "summary": {},
+            "cached": False,
+            "source": "wechat-subscription-feed",
+            "cache": _workflow_cache_status(),
+        }
+    rows = _wechat_article_feed(state, limit=limit)
+    return {
+        "items": rows,
+        "summary": _summarize_state(state),
+        "cached": not refresh,
+        "source": "wechat-subscription-feed",
+        "cache": _workflow_cache_status(),
+    }
+
+
+@app.get("/workflow/wechat/articles/{content_id}")
+def workflow_wechat_article_detail(content_id: str, fetch_detail: bool = True) -> dict[str, Any]:
+    state = _cached_workflow_state(refresh=False, cache_only=True)
+    if state is None:
+        state = _cached_workflow_state(refresh=False)
+    detail = _wechat_article_detail_payload(state, content_id, fetch_detail=fetch_detail) if state is not None else None
+    if detail is None:
+        return {"ok": False, "error": f"content not found: {content_id}", "cache": _workflow_cache_status()}
+    return {"ok": True, **detail, "cache": _workflow_cache_status()}
 
 
 @app.post("/workflow/rewrite/subscriptions/refresh/stream")
@@ -3198,17 +3403,20 @@ def _cached_workflow_state(*, refresh: bool, cache_only: bool = False) -> Hotspo
     expires_at = _WORKFLOW_CACHE.get("expires_at")
     cached = _WORKFLOW_CACHE.get("state")
     if not refresh and cached is not None and isinstance(expires_at, datetime) and expires_at > now:
-        return cached
+        state = _sanitize_rewrite_candidate_state(cached)
+        _WORKFLOW_CACHE["state"] = state
+        return state
     if not refresh:
         cached = _load_workflow_state_cache(now=now, allow_expired=cache_only)
         if cached is not None:
             return cached
     if cache_only:
         return None
-    state = _build_rewrite_candidate_state()
+    state = _sanitize_rewrite_candidate_state(_build_rewrite_candidate_state())
     _WORKFLOW_CACHE["state"] = state
     _WORKFLOW_CACHE["expires_at"] = now + _WORKFLOW_CACHE_TTL
-    _save_workflow_state_cache(state, expires_at=now + _WORKFLOW_CACHE_TTL)
+    _WORKFLOW_CACHE["cached_at"] = now
+    _save_workflow_state_cache(state, expires_at=now + _WORKFLOW_CACHE_TTL, cached_at=now)
     return state
 
 
@@ -3267,7 +3475,31 @@ def _build_rewrite_candidate_state_from_subscriptions() -> HotspotState | None:
     }
     for agent in (NormalizationAgent(), AIRelevanceAgent(), HotnessScoringAgent(), TrendAnalysisAgent(), QualityControlAgent()):
         state.update(agent.invoke(state))
-    return state
+    return _sanitize_rewrite_candidate_state(state)
+
+
+def _sanitize_rewrite_candidate_state(state: HotspotState) -> HotspotState:
+    contents = list(state.get("normalized_contents", []))
+    if not contents:
+        return state
+    kept_contents: list[NormalizedContent] = []
+    removed = 0
+    for content in contents:
+        if content.platform == Platform.WECHAT and content.media_type == MediaType.ARTICLE and not _is_valid_wechat_candidate(content):
+            removed += 1
+            continue
+        kept_contents.append(content)
+    if removed <= 0:
+        return state
+    kept_ids = {content.content_id for content in kept_contents}
+    quality_info = list(state.get("quality_info", []))
+    quality_info.append(f"rewrite_candidates_filtered_by_policy:{removed}")
+    return {
+        **state,
+        "normalized_contents": kept_contents,
+        "hotness_scores": [score for score in state.get("hotness_scores", []) if score.content_id in kept_ids],
+        "quality_info": sorted(set(quality_info)),
+    }
 
 
 def _wechat_article_match_keywords() -> list[str]:
@@ -3283,12 +3515,13 @@ def _wechat_article_match_keywords() -> list[str]:
     return deduped
 
 
-def _save_workflow_state_cache(state: HotspotState, *, expires_at: datetime) -> None:
+def _save_workflow_state_cache(state: HotspotState, *, expires_at: datetime, cached_at: datetime | None = None) -> None:
     try:
+        cached_at = cached_at or datetime.now(timezone.utc)
         WORKFLOW_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "version": 1,
-            "cached_at": datetime.now(timezone.utc).isoformat(),
+            "cached_at": cached_at.isoformat(),
             "expires_at": expires_at.isoformat(),
             "state": jsonable_encoder(
                 {
@@ -3332,6 +3565,7 @@ def _delete_previous_wechat_download_cache(*, now: datetime | None = None) -> di
             workflow_cache_deleted += 1
     _WORKFLOW_CACHE["state"] = None
     _WORKFLOW_CACHE["expires_at"] = None
+    _WORKFLOW_CACHE["cached_at"] = None
     return {
         "article_list_cache_deleted": article_list_deleted,
         "article_detail_cache_deleted": article_detail_deleted,
@@ -3374,6 +3608,7 @@ def _load_workflow_state_cache(*, now: datetime | None = None, allow_expired: bo
 
     try:
         expires_at = _parse_cached_datetime(payload.get("expires_at"))
+        cached_at = _parse_cached_datetime(payload.get("cached_at"))
         if expires_at is None:
             return None
         if expires_at <= now and not allow_expired:
@@ -3392,11 +3627,13 @@ def _load_workflow_state_cache(*, now: datetime | None = None, allow_expired: bo
             "review_flags": review_flags,
             "human_review_required": bool(review_flags),
         }
+        state = _sanitize_rewrite_candidate_state(state)
     except (KeyError, TypeError, ValueError):
         return None
 
     _WORKFLOW_CACHE["state"] = state
     _WORKFLOW_CACHE["expires_at"] = expires_at
+    _WORKFLOW_CACHE["cached_at"] = cached_at
     return state
 
 
@@ -3433,6 +3670,24 @@ def _parse_cached_datetime(value: Any) -> datetime | None:
     if parsed.tzinfo is None:
         return parsed.replace(tzinfo=timezone.utc)
     return parsed
+
+
+def _isoformat_datetime(value: datetime | None) -> str | None:
+    if value is None:
+        return None
+    return value.astimezone(timezone.utc).isoformat()
+
+
+def _workflow_cache_status() -> dict[str, Any]:
+    cached_at = _WORKFLOW_CACHE.get("cached_at")
+    expires_at = _WORKFLOW_CACHE.get("expires_at")
+    return {
+        "source": "workflow_rewrite_state",
+        "cached_at": _isoformat_datetime(cached_at if isinstance(cached_at, datetime) else None),
+        "expires_at": _isoformat_datetime(expires_at if isinstance(expires_at, datetime) else None),
+        "file": str(WORKFLOW_CACHE_FILE),
+        "has_memory_cache": _WORKFLOW_CACHE.get("state") is not None,
+    }
 
 
 def _review_flags_from_quality_flags(quality_flags: list[str]) -> list[str]:
@@ -3484,6 +3739,73 @@ def _rewrite_candidates(state: HotspotState, limit: int = 20) -> list[dict[str, 
     return rows
 
 
+def _wechat_article_feed(state: HotspotState, limit: int = 50) -> list[dict[str, Any]]:
+    rows = [
+        _candidate_row(content, _score_for_content(state, content.content_id), rank=0, total=limit)
+        for content in state.get("normalized_contents", [])
+        if _is_valid_wechat_candidate(content)
+    ]
+    rows.sort(key=lambda item: (float(item.get("published_timestamp") or 0), int(item.get("reads") or 0)), reverse=True)
+    rows = rows[: max(1, limit)]
+    for index, row in enumerate(rows, start=1):
+        row["rank"] = index
+        row["source"] = "wechat-subscription-feed"
+        row["feed_reason"] = "按发布时间倒序浏览订阅号文章，不参与改写候选排序。"
+    return rows
+
+
+def _knowledge_first_candidates(state: HotspotState, limit: int = 20) -> list[dict[str, Any]]:
+    rows = _rewrite_candidates(state, limit=max(limit, 100))
+    rows.sort(key=_knowledge_first_sort_key, reverse=True)
+    rows = rows[: max(1, limit)]
+    for index, row in enumerate(rows, start=1):
+        knowledge_score = float(row.get("knowledge_content_score") or 0)
+        row["rank"] = index
+        row["knowledge_rank"] = index
+        row["source"] = "knowledge-first"
+        row["knowledge_badge"] = _knowledge_badge(row)
+        row["knowledge_reason"] = _knowledge_reason(row)
+        row["light"] = _candidate_light(index, limit, knowledge_score)
+    return rows
+
+
+def _knowledge_first_sort_key(item: dict[str, Any]) -> tuple[float, float, int, float, float]:
+    return (
+        float(item.get("knowledge_content_score") or 0),
+        float(item.get("knowledge_score") or 0),
+        1 if item.get("detail_status") in {"ready", "short"} else 0,
+        float(item.get("ai_relevance_score") or 0),
+        float(item.get("published_timestamp") or 0),
+    )
+
+
+def _knowledge_badge(item: dict[str, Any]) -> str:
+    marketing_signals = item.get("marketing_signals") if isinstance(item.get("marketing_signals"), list) else []
+    if marketing_signals:
+        return "营销风险"
+    content_type = str(item.get("knowledge_content_type") or "知识型")
+    score = float(item.get("knowledge_content_score") or 0)
+    if score >= 70:
+        return f"优质{content_type}"
+    if score >= 45:
+        return content_type
+    return "知识候选"
+
+
+def _knowledge_reason(item: dict[str, Any]) -> str:
+    signals = item.get("knowledge_signals") if isinstance(item.get("knowledge_signals"), list) else []
+    structures = item.get("structure_signals") if isinstance(item.get("structure_signals"), list) else []
+    marketing = item.get("marketing_signals") if isinstance(item.get("marketing_signals"), list) else []
+    parts = []
+    if signals:
+        parts.append("知识信号：" + " / ".join(str(value) for value in signals[:4]))
+    if structures:
+        parts.append("结构：" + " / ".join(str(value) for value in structures[:3]))
+    if marketing:
+        parts.append("营销风险：" + " / ".join(str(value) for value in marketing[:3]))
+    return "；".join(parts) or "标题和摘要暂未命中明显知识结构，建议查看详情确认。"
+
+
 def _wechat_10w_hot_candidates(state: HotspotState, limit: int = 20) -> list[dict[str, Any]]:
     rows = _rewrite_candidates(state, limit=max(limit, 100))
     rows.sort(key=_wechat_10w_hot_sort_key, reverse=True)
@@ -3532,6 +3854,12 @@ def _wechat_10w_hot_reason(reads: int | None, hot_score: float) -> str:
 def _is_valid_wechat_candidate(content: NormalizedContent) -> bool:
     if content.platform != Platform.WECHAT or content.media_type != MediaType.ARTICLE:
         return False
+    if not _has_usable_article_title(content.title):
+        return False
+    if _looks_like_marketing_wechat_article(content):
+        return False
+    if _looks_like_hollow_wechat_article(content):
+        return False
     account = content.raw_payload.get("account") if isinstance(content.raw_payload.get("account"), dict) else {}
     fakeid = str(account.get("fakeid") or "")
     nickname = str(account.get("nickname") or content.author or "")
@@ -3542,13 +3870,44 @@ def _is_valid_wechat_candidate(content: NormalizedContent) -> bool:
     return True
 
 
+def _has_usable_article_title(title: str | None) -> bool:
+    cleaned = _plain_text(str(title or "")).strip(" \t\r\n-—_｜|：:，,。.")
+    if not cleaned:
+        return False
+    normalized = re.sub(r"\s+", "", cleaned).lower()
+    return normalized not in {value.lower() for value in CANDIDATE_PLACEHOLDER_TITLES}
+
+
+def _looks_like_marketing_wechat_article(content: NormalizedContent) -> bool:
+    source = f"{content.title or ''}\n{content.text or ''}".lower()
+    return bool(_matched_keywords(source, KNOWLEDGE_MARKETING_KEYWORDS))
+
+
+def _looks_like_hollow_wechat_article(content: NormalizedContent) -> bool:
+    title = _plain_text(str(content.title or ""))
+    text = _plain_text(str(content.text or ""))
+    source = f"{title}\n{text}".lower()
+    hollow_signals = _matched_keywords(source, HOLLOW_ARTICLE_KEYWORDS)
+    if not hollow_signals:
+        return False
+    concrete_signals = _matched_keywords(source, KNOWLEDGE_SIGNAL_KEYWORDS) + _matched_keywords(source, KNOWLEDGE_STRUCTURE_KEYWORDS)
+    if concrete_signals:
+        return False
+    title_hollow_signals = _matched_keywords(title.lower(), HOLLOW_ARTICLE_KEYWORDS)
+    if len(title_hollow_signals) >= 2:
+        return True
+    return len(hollow_signals) >= 3 and _plain_text_length(text) < 600
+
+
 def _candidate_row(content: NormalizedContent, hotness_score: float, *, rank: int, total: int) -> dict[str, Any]:
     metrics = content.metrics
     reads = metrics.reads if metrics.reads is not None else metrics.views
     image_count = len(_source_image_urls(content.raw_payload))
     readiness, readiness_label, readiness_detail = _candidate_readiness(content)
+    text_length = len((content.text or "").strip())
     ai_signals = _ai_knowledge_signals(content)
     ai_hot_score = _ai_hot_candidate_score(content, hotness_score, ai_signals, readiness)
+    cache_status = _workflow_cache_status()
     return {
         "rank": rank,
         "content_id": content.content_id,
@@ -3559,17 +3918,32 @@ def _candidate_row(content: NormalizedContent, hotness_score: float, *, rank: in
         "ai_hot_score": round(ai_hot_score, 2),
         "ai_relevance_score": round(ai_signals["ai_relevance_score"], 2),
         "knowledge_score": round(ai_signals["knowledge_score"], 2),
+        "knowledge_content_score": round(ai_signals["knowledge_content_score"], 2),
+        "knowledge_content_type": ai_signals["knowledge_content_type"],
         "matched_keywords": ai_signals["matched_keywords"],
         "knowledge_signals": ai_signals["knowledge_signals"],
+        "structure_signals": ai_signals["structure_signals"],
+        "marketing_signals": ai_signals["marketing_signals"],
+        "marketing_penalty": round(ai_signals["marketing_penalty"], 2),
+        "published_at": _isoformat_datetime(_parse_cached_datetime(content.published_at)),
+        "published_timestamp": _content_recency_timestamp(content),
+        "text_length": text_length,
         "readiness": readiness,
         "readiness_label": readiness_label,
         "readiness_detail": readiness_detail,
+        "detail_status": readiness,
+        "detail_status_label": readiness_label,
+        "detail_status_detail": readiness_detail,
         "image_count": image_count,
         "has_images": image_count > 0,
         "reads": reads,
+        "read_source": "wechat-download-api" if reads is not None else "missing",
         "likes": metrics.likes,
         "comments": metrics.comments,
         "url": content.url,
+        "cache_source": "workflow_rewrite_state",
+        "cache_cached_at": cache_status.get("cached_at"),
+        "cache_expires_at": cache_status.get("expires_at"),
     }
 
 
@@ -3577,15 +3951,72 @@ def _ai_knowledge_signals(content: NormalizedContent) -> dict[str, Any]:
     source = f"{content.title} {content.author or ''} {content.text or ''}".lower()
     matched_keywords = _matched_keywords(source, AI_KNOWLEDGE_KEYWORDS)
     knowledge_signals = _matched_keywords(source, KNOWLEDGE_SIGNAL_KEYWORDS)
+    structure_signals = _matched_keywords(source, KNOWLEDGE_STRUCTURE_KEYWORDS)
+    marketing_signals = _matched_keywords(source, KNOWLEDGE_MARKETING_KEYWORDS)
     title_source = (content.title or "").lower()
     title_ai_matches = _matched_keywords(title_source, AI_KNOWLEDGE_KEYWORDS)
     title_knowledge_matches = _matched_keywords(title_source, KNOWLEDGE_SIGNAL_KEYWORDS)
+    title_structure_matches = _matched_keywords(title_source, KNOWLEDGE_STRUCTURE_KEYWORDS)
+    marketing_penalty = min(35.0, len(marketing_signals) * 10.0)
+    ai_relevance_score = min(40.0, len(matched_keywords) * 5.0 + len(title_ai_matches) * 6.0)
+    knowledge_score = min(35.0, len(knowledge_signals) * 3.5 + len(title_knowledge_matches) * 5.0)
+    structure_score = min(15.0, len(structure_signals) * 3.0 + len(title_structure_matches) * 4.0)
+    freshness_score = _knowledge_freshness_score(content)
+    knowledge_content_score = max(
+        0.0,
+        min(
+            100.0,
+            knowledge_score
+            + min(25.0, ai_relevance_score * 0.65)
+            + structure_score
+            + freshness_score
+            - marketing_penalty,
+        ),
+    )
     return {
         "matched_keywords": matched_keywords[:8],
         "knowledge_signals": knowledge_signals[:8],
-        "ai_relevance_score": min(40.0, len(matched_keywords) * 5.0 + len(title_ai_matches) * 6.0),
-        "knowledge_score": min(25.0, len(knowledge_signals) * 3.5 + len(title_knowledge_matches) * 4.0),
+        "structure_signals": structure_signals[:8],
+        "marketing_signals": marketing_signals[:8],
+        "ai_relevance_score": ai_relevance_score,
+        "knowledge_score": knowledge_score,
+        "knowledge_content_score": knowledge_content_score,
+        "knowledge_content_type": _knowledge_content_type(knowledge_signals, structure_signals, title_source),
+        "marketing_penalty": marketing_penalty,
     }
+
+
+def _knowledge_freshness_score(content: NormalizedContent) -> float:
+    published_at = _parse_cached_datetime(content.published_at)
+    if published_at is None:
+        return 2.0
+    age_hours = max(0.0, (datetime.now(timezone.utc) - published_at.astimezone(timezone.utc)).total_seconds() / 3600.0)
+    if age_hours <= 24:
+        return 10.0
+    if age_hours <= 72:
+        return 7.0
+    if age_hours <= 168:
+        return 4.0
+    return 1.0
+
+
+def _knowledge_content_type(
+    knowledge_signals: list[str],
+    structure_signals: list[str],
+    title_source: str,
+) -> str:
+    source = " ".join([title_source, *knowledge_signals, *structure_signals])
+    if any(keyword in source for keyword in ("面试题", "面试总结")):
+        return "面试题型"
+    if any(keyword in source for keyword in ("对比", "区别", "选型", "核心区别")):
+        return "对比型"
+    if any(keyword in source for keyword in ("原理", "底层", "核心逻辑", "什么是", "为什么")):
+        return "原理型"
+    if any(keyword in source for keyword in ("教程", "指南", "入门", "进阶", "实战", "实践", "如何", "怎么做")):
+        return "教程型"
+    if any(keyword in source for keyword in ("案例", "复盘", "实际项目", "工程实践")):
+        return "案例复盘型"
+    return "知识型"
 
 
 def _matched_keywords(source: str, keywords: tuple[str, ...]) -> list[str]:
@@ -3654,7 +4085,11 @@ def _rewrite_selected_article(state: HotspotState, content_id: str) -> tuple[Gen
     content = contents.get(content_id)
     if content is None:
         return None, {}
+    if not _is_valid_wechat_candidate(content):
+        return None, {}
     content = _enrich_content_detail(content)
+    if not _is_valid_wechat_candidate(content):
+        return None, {}
     content, image_text_evidence = _augment_content_with_image_text(content)
     trend = TrendCluster(
         trend_id=f"selected-{content.content_id}",
@@ -3714,6 +4149,8 @@ def _state_from_candidate_snapshot(candidate: Any) -> HotspotState | None:
         source_api="wechat-download-api",
         raw_payload={"provider_payload": candidate},
     )
+    if not _is_valid_wechat_candidate(content):
+        return None
     score = HotnessScore(
         content_id=content_id,
         hotness_score=float(candidate.get("hotness_score") or 0),
@@ -3734,6 +4171,56 @@ def _int_or_none(value: Any) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def _wechat_article_detail_payload(
+    state: HotspotState,
+    content_id: str,
+    *,
+    fetch_detail: bool,
+) -> dict[str, Any] | None:
+    contents = {content.content_id: content for content in state.get("normalized_contents", [])}
+    content = contents.get(content_id)
+    if content is None:
+        return None
+
+    base_row = _candidate_row(content, _score_for_content(state, content.content_id), rank=0, total=1)
+    detail_status = {
+        "status": base_row["detail_status"],
+        "initial_text_length": base_row["text_length"],
+        "final_text_length": base_row["text_length"],
+        "message": base_row["detail_status_detail"],
+    }
+    enriched = content
+    if fetch_detail:
+        enriched, detail_status = _enrich_content_detail_with_status(content)
+
+    text = enriched.text or ""
+    images = _source_image_urls(enriched.raw_payload)
+    return {
+        "content_id": enriched.content_id,
+        "article": {
+            **base_row,
+            "title": enriched.title,
+            "author": enriched.author or base_row.get("author"),
+            "url": enriched.url,
+            "text_length": len(text.strip()),
+            "image_count": len(images),
+            "has_images": bool(images),
+        },
+        "detail_status": detail_status,
+        "source_images": images,
+        "text_preview": _clip_text_preview(text),
+        "full_text": text if len(text) <= int(os.getenv("WECHAT_DETAIL_FULL_TEXT_MAX_CHARS", "12000")) else "",
+        "full_text_truncated": len(text) > int(os.getenv("WECHAT_DETAIL_FULL_TEXT_MAX_CHARS", "12000")),
+    }
+
+
+def _clip_text_preview(text: str, limit: int = 1200) -> str:
+    normalized = "\n".join(line.strip() for line in str(text or "").splitlines() if line.strip())
+    if len(normalized) <= limit:
+        return normalized
+    return normalized[:limit].rstrip() + "..."
 
 
 def _enrich_content_detail(content):
@@ -3912,6 +4399,7 @@ def _rewrite_workspace_html() -> str:
       font-weight: 700;
     }
     button.secondary { background: #475467; }
+    button.tertiary { background: #0f766e; }
     button:disabled { opacity: 0.55; cursor: not-allowed; }
     .muted { color: var(--muted); }
     .workspace-links { display: flex; gap: 10px; flex-wrap: wrap; margin: 8px 0 18px; }
@@ -3926,6 +4414,27 @@ def _rewrite_workspace_html() -> str:
     }
     .actions { display: flex; gap: 10px; align-items: center; margin-bottom: 12px; flex-wrap: wrap; }
     .selected { outline: 2px solid rgba(37, 99, 235, 0.35); background: #f8fbff; }
+    .row-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+    .detail-card {
+      border: 1px solid var(--line);
+      background: #f8fbff;
+      border-radius: 12px;
+      padding: 12px;
+      margin: 0 0 14px;
+    }
+    .detail-card dl { display: grid; grid-template-columns: 110px 1fr; gap: 4px 10px; margin: 8px 0; }
+    .detail-card dt { color: var(--muted); }
+    .detail-card dd { margin: 0; }
+    .detail-preview {
+      max-height: 240px;
+      overflow: auto;
+      white-space: pre-wrap;
+      background: #fff;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 10px;
+      margin: 8px 0 0;
+    }
     .notice {
       border-left: 4px solid var(--yellow);
       background: #fffbeb;
@@ -3977,6 +4486,8 @@ def _rewrite_workspace_html() -> str:
           <h2 style="margin-right:auto;">热度公众号文章</h2>
           <button id="manual-subscription-refresh-btn" onclick="manualRefreshSubscriptions()">手动更新订阅号文章</button>
           <button class="secondary" onclick="loadCandidates(true)">重新拉取</button>
+          <button class="secondary" onclick="loadArticleFeed(false)">今日订阅流</button>
+          <button class="secondary" onclick="loadKnowledgeCandidates(false)">知识型优先</button>
           <button class="secondary" onclick="loadHotCandidates(false)">wechat-10w-hot 高热榜</button>
         </div>
         <p id="status" class="muted">正在加载候选文章...</p>
@@ -3996,6 +4507,10 @@ def _rewrite_workspace_html() -> str:
 
       <section class="panel">
         <h2>选中文章改写结果</h2>
+        <div id="article-detail" class="detail-card">
+          <strong>文章详情</strong>
+          <p class="muted">点击左侧“查看详情”会先补拉全文并展示预览，不会触发改写。</p>
+        </div>
         <p id="rewrite-status" class="muted">请选择左侧一篇文章。</p>
         <ol id="rewrite-progress" class="progress-list"></ol>
         <p id="image-status" class="muted">生成改写稿后，每条“配图建议”旁会出现图片生成图标。</p>
@@ -4020,6 +4535,7 @@ def _rewrite_workspace_html() -> str:
     let activeRewriteTimerStartMs = 0;
     let activeRewriteTimerItem = null;
     let currentCandidateMode = "candidates";
+    let activeDetailRequestId = 0;
 
     async function loadCandidates(refresh = false) {
       const showedLocalCache = !refresh && renderCachedCandidates();
@@ -4060,6 +4576,32 @@ def _rewrite_workspace_html() -> str:
       }
       const note = data.summary && data.summary.hot_rank_note ? ` ${data.summary.hot_rank_note}` : "";
       setStatus(`已用 wechat-10w-hot 生成高热榜 ${items.length} 篇。${note}`);
+    }
+
+    async function loadArticleFeed(refresh = false) {
+      setStatus(refresh ? "正在刷新今日订阅流..." : "正在读取今日订阅流...");
+      const data = await fetchJson(`/workflow/wechat/articles?refresh=${refresh ? "true" : "false"}&cache_only=${refresh ? "false" : "true"}&limit=50`);
+      const items = data.items || [];
+      currentCandidateMode = "feed";
+      renderCandidates(items);
+      if (items.length > 0) {
+        cacheCandidates({ ...data, items });
+      }
+      const cachedAt = data.cache && data.cache.cached_at ? ` 候选缓存：${formatDateTime(data.cache.cached_at)}。` : "";
+      setStatus(`已加载今日订阅流 ${items.length} 篇，按发布时间倒序。${cachedAt}`);
+    }
+
+    async function loadKnowledgeCandidates(refresh = false) {
+      setStatus(refresh ? "正在刷新知识型优先候选..." : "正在读取知识型优先候选...");
+      const data = await fetchJson(`/workflow/rewrite/knowledge-candidates?refresh=${refresh ? "true" : "false"}&cache_only=${refresh ? "false" : "true"}&limit=20`);
+      const items = data.items || [];
+      currentCandidateMode = "knowledge";
+      renderCandidates(items);
+      if (items.length > 0) {
+        cacheCandidates({ ...data, items });
+      }
+      const note = data.summary && data.summary.knowledge_rank_note ? ` ${data.summary.knowledge_rank_note}` : "";
+      setStatus(`已加载知识型优先候选 ${items.length} 篇。${note}`);
     }
 
     async function refreshCandidatesInBackground() {
@@ -4142,6 +4684,10 @@ def _rewrite_workspace_html() -> str:
         const items = event.result.items || [];
         if (currentCandidateMode === "hot") {
           loadHotCandidates(false);
+        } else if (currentCandidateMode === "feed") {
+          loadArticleFeed(false);
+        } else if (currentCandidateMode === "knowledge") {
+          loadKnowledgeCandidates(false);
         } else {
           renderCandidates(items);
         }
@@ -4250,17 +4796,23 @@ def _rewrite_workspace_html() -> str:
           <td>${item.rank}</td>
           <td class="title-cell">
             <strong>${escapeHtml(item.title || "")}</strong>
-            <br>${item.url ? `<a href="${item.url}" target="_blank">原文</a>` : `<span class="muted">无原文链接</span>`}
+            <br>${item.url ? `<a href="${escapeHtml(item.url)}" target="_blank" rel="noopener noreferrer">原文</a>` : `<span class="muted">无原文链接</span>`}
             <br><span class="muted">${formatSignals(item)}</span>
+            <br><span class="muted">${formatCacheSignals(item)}</span>
           </td>
           <td>${escapeHtml(item.author || "未知")}</td>
-          <td>${item.ai_hot_score || item.hotness_score}<br><span class="muted">原热度 ${item.hotness_score}</span></td>
+          <td>${item.ai_hot_score || item.hotness_score}<br><span class="muted">知识 ${item.knowledge_content_score || item.knowledge_score || 0}</span><br><span class="muted">原热度 ${item.hotness_score}</span></td>
           <td>${formatMetric(item.reads)}</td>
           <td>
-            ${escapeHtml(item.hot_badge || item.readiness_label || "待检查")}
-            <br><span class="muted">${escapeHtml(item.hot_reason || `${item.image_count || 0} 张图`)}</span>
+            ${escapeHtml(item.knowledge_badge || item.hot_badge || item.readiness_label || "待检查")}
+            <br><span class="muted">${escapeHtml(item.knowledge_reason || item.hot_reason || `${item.image_count || 0} 张图`)}</span>
           </td>
-          <td><button onclick="rewriteSelected('${item.content_id}')">选择改写</button></td>
+          <td>
+            <div class="row-actions">
+              <button class="tertiary" onclick="viewArticleDetail('${item.content_id}')">查看详情</button>
+              <button onclick="rewriteSelected('${item.content_id}')">选择改写</button>
+            </div>
+          </td>
         `;
         tbody.appendChild(tr);
       }
@@ -4274,14 +4826,87 @@ def _rewrite_workspace_html() -> str:
       return String(number);
     }
 
+    function formatDateTime(value) {
+      try {
+        return new Date(value).toLocaleString();
+      } catch (_error) {
+        return String(value || "未知");
+      }
+    }
+
     function formatSignals(item) {
       const keywords = Array.isArray(item.matched_keywords) ? item.matched_keywords.slice(0, 4) : [];
       const knowledge = Array.isArray(item.knowledge_signals) ? item.knowledge_signals.slice(0, 3) : [];
+      const structures = Array.isArray(item.structure_signals) ? item.structure_signals.slice(0, 3) : [];
+      const marketing = Array.isArray(item.marketing_signals) ? item.marketing_signals.slice(0, 2) : [];
       const parts = [];
+      if (item.knowledge_content_type) parts.push(`类型: ${item.knowledge_content_type}`);
       if (keywords.length) parts.push(`AI: ${keywords.join(" / ")}`);
       if (knowledge.length) parts.push(`知识: ${knowledge.join(" / ")}`);
+      if (structures.length) parts.push(`结构: ${structures.join(" / ")}`);
+      if (marketing.length) parts.push(`营销风险: ${marketing.join(" / ")}`);
       if (item.readiness_detail) parts.push(item.readiness_detail);
       return parts.join("；") || "暂无明显 AI 知识信号";
+    }
+
+    function formatCacheSignals(item) {
+      const parts = [];
+      if (item.published_at) parts.push(`发布：${formatDateTime(item.published_at)}`);
+      parts.push(`正文：${item.text_length || 0} 字`);
+      parts.push(`阅读来源：${item.read_source === "missing" ? "未返回" : "接口返回"}`);
+      parts.push(`详情：${item.detail_status_label || item.readiness_label || "待检查"}`);
+      if (item.cache_cached_at) parts.push(`候选缓存：${formatDateTime(item.cache_cached_at)}`);
+      return parts.join("；");
+    }
+
+    async function viewArticleDetail(contentId) {
+      const requestId = ++activeDetailRequestId;
+      document.querySelectorAll("tr.selected").forEach(row => row.classList.remove("selected"));
+      const row = document.querySelector(`tr[data-content-id="${CSS.escape(contentId)}"]`);
+      if (row) row.classList.add("selected");
+      const item = candidatesById.get(contentId) || {};
+      renderArticleDetailLoading(item);
+      try {
+        const data = await fetchJson(`/workflow/wechat/articles/${encodeURIComponent(contentId)}?fetch_detail=true`);
+        if (requestId !== activeDetailRequestId) return;
+        if (!data.ok) throw new Error(data.error || "详情不存在");
+        renderArticleDetail(data);
+      } catch (error) {
+        if (requestId === activeDetailRequestId) {
+          document.getElementById("article-detail").innerHTML = `<strong>文章详情</strong><p class="muted">详情读取失败：${escapeHtml(error)}</p>`;
+        }
+      }
+    }
+
+    function renderArticleDetailLoading(item) {
+      document.getElementById("article-detail").innerHTML = `
+        <strong>${escapeHtml(item.title || "文章详情")}</strong>
+        <p class="muted">正在补拉全文详情，只用于预览，不会触发改写...</p>
+      `;
+    }
+
+    function renderArticleDetail(data) {
+      const article = data.article || {};
+      const status = data.detail_status || {};
+      const cache = data.cache || {};
+      const preview = data.text_preview || "暂无正文预览。";
+      const contentId = article.content_id || data.content_id || "";
+      document.getElementById("article-detail").innerHTML = `
+        <strong>${escapeHtml(article.title || "文章详情")}</strong>
+        <dl>
+          <dt>公众号</dt><dd>${escapeHtml(article.author || "未知")}</dd>
+          <dt>原文</dt><dd>${article.url ? `<a href="${escapeHtml(article.url)}" target="_blank" rel="noopener noreferrer">打开原文</a>` : "无链接"}</dd>
+          <dt>发布</dt><dd>${article.published_at ? formatDateTime(article.published_at) : "未知"}</dd>
+          <dt>详情状态</dt><dd>${escapeHtml(status.message || article.detail_status_detail || "未知")}</dd>
+          <dt>正文长度</dt><dd>${article.text_length || 0} 字</dd>
+          <dt>图片</dt><dd>${article.image_count || 0} 张</dd>
+          <dt>缓存</dt><dd>${cache.cached_at ? `候选缓存 ${formatDateTime(cache.cached_at)}` : "暂无候选缓存时间"}</dd>
+        </dl>
+        <div class="row-actions">
+          <button onclick="rewriteSelected('${escapeHtml(contentId)}')">用这篇改写</button>
+        </div>
+        <div class="detail-preview">${escapeHtml(preview)}</div>
+      `;
     }
 
     async function rewriteSelected(contentId) {

@@ -15,7 +15,9 @@ from html import escape
 from dataclasses import replace
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
+from urllib.request import Request, urlopen
+from urllib.error import HTTPError, URLError
 
 from fastapi import FastAPI, Response
 from fastapi.encoders import jsonable_encoder
@@ -53,6 +55,7 @@ from app.schemas.hotspot import (
 )
 from app.tools.video_render import StoryboardClip, render_remotion_timeline_draft, render_video_draft
 from app.tools.wechat_download_api import (
+    ARTICLE_DETAIL_CACHE_DIR,
     ARTICLE_LIST_CACHE_DIR,
     WechatDownloadApiClient,
     _is_excluded_account_name,
@@ -70,6 +73,53 @@ WORKFLOW_CACHE_FILE = ROOT_DIR / ".cache" / "workflow_rewrite_state.json"
 app = FastAPI(title="LangGraph Study Server")
 _WORKFLOW_CACHE: dict[str, Any] = {"state": None, "expires_at": None}
 _WORKFLOW_CACHE_TTL = timedelta(seconds=int(os.getenv("WORKFLOW_CACHE_TTL_SECONDS", os.getenv("WECHAT_REFRESH_INTERVAL_SECONDS", "14400"))))
+
+AI_KNOWLEDGE_KEYWORDS = (
+    "ai",
+    "人工智能",
+    "大模型",
+    "llm",
+    "agent",
+    "智能体",
+    "gpt",
+    "deepseek",
+    "qwen",
+    "通义",
+    "豆包",
+    "kimi",
+    "claude",
+    "gemini",
+    "prompt",
+    "提示词",
+    "rag",
+    "向量",
+    "模型",
+    "算力",
+    "机器学习",
+    "深度学习",
+    "生成式",
+    "aigc",
+)
+KNOWLEDGE_SIGNAL_KEYWORDS = (
+    "原理",
+    "教程",
+    "指南",
+    "方法",
+    "实践",
+    "案例",
+    "拆解",
+    "复盘",
+    "入门",
+    "进阶",
+    "框架",
+    "流程",
+    "工具",
+    "开源",
+    "技术",
+    "架构",
+    "对比",
+    "报告",
+)
 
 
 @app.on_event("startup")
@@ -329,6 +379,29 @@ def workflow_rewrite_candidates(refresh: bool = False, cache_only: bool = False)
     return {"items": rows, "summary": _summarize_state(state), "cached": not refresh}
 
 
+@app.get("/workflow/rewrite/hot-candidates")
+def workflow_rewrite_hot_candidates(refresh: bool = False, cache_only: bool = False, limit: int = 20) -> dict[str, Any]:
+    try:
+        state = _cached_workflow_state(refresh=refresh, cache_only=cache_only)
+    except Exception as exc:
+        return {
+            "items": [],
+            "summary": {"error": _clean_subprocess_error(exc)},
+            "cached": False,
+            "source": "wechat-10w-hot",
+            "error": _clean_subprocess_error(exc),
+        }
+    if state is None:
+        return {"items": [], "summary": {}, "cached": False, "source": "wechat-10w-hot"}
+    rows = _wechat_10w_hot_candidates(state, limit=limit)
+    summary = _summarize_state(state)
+    summary["hot_rank_source"] = "wechat-10w-hot"
+    summary["hot_rank_note"] = (
+        "优先按真实阅读量排序；当前数据源未返回阅读量时，自动退回按 AI 热度和本地热度排序。"
+    )
+    return {"items": rows, "summary": summary, "cached": not refresh, "source": "wechat-10w-hot"}
+
+
 @app.post("/workflow/rewrite/subscriptions/refresh/stream")
 def workflow_rewrite_subscription_refresh_stream() -> StreamingResponse:
     return StreamingResponse(
@@ -356,6 +429,7 @@ def _stream_rewrite_subscription_refresh():
         message=(
             f"已清理前一天及更早的下载缓存，用时 {_format_elapsed(time.monotonic() - cleanup_started_at)}："
             f"删除文章列表缓存 {cleanup['article_list_cache_deleted']} 个，"
+            f"删除文章详情缓存 {cleanup['article_detail_cache_deleted']} 个，"
             f"删除候选缓存 {cleanup['workflow_cache_deleted']} 个。"
         ),
         cleanup=cleanup,
@@ -440,15 +514,15 @@ def _stream_rewrite_selected(payload: dict[str, Any]):
         initial_text_length = len(content.text or "")
         yield emit(
             "progress",
-            message=f"已命中{state_label}：准备改写《{title}》，当前缓存正文 {initial_text_length} 字。",
+            message=f"已命中{state_label}：准备改写《{title}》，当前候选摘要 {initial_text_length} 字，接下来会补拉完整正文。",
             article_title=title,
             source_text_length=initial_text_length,
         )
 
         try:
             detail_started_at = time.monotonic()
-            content = yield from _run_with_stream_progress(
-                lambda: _enrich_content_detail(content),
+            content, detail_status = yield from _run_with_stream_progress(
+                lambda: _enrich_content_detail_with_status(content),
                 emit=emit,
                 waiting_message=lambda elapsed: f"正在校验或补拉《{title}》全文，已耗时 {elapsed}。",
                 progress_phase="rewrite-detail",
@@ -456,6 +530,20 @@ def _stream_rewrite_selected(payload: dict[str, Any]):
             detail_elapsed = time.monotonic() - detail_started_at
             source_text_length = len(content.text or "")
             source_images = _source_image_urls(content.raw_payload)
+            if source_text_length < 200:
+                yield emit(
+                    "error",
+                    message=(
+                        f"全文未就绪：《{title}》当前正文只有 {source_text_length} 字，"
+                        f"补拉状态：{detail_status.get('message', '未知原因')}。"
+                        "请稍后重试，或检查 wechat-download-api 登录状态和文章详情接口。"
+                    ),
+                    article_title=title,
+                    source_text_length=source_text_length,
+                    detail_status=detail_status,
+                    elapsed_seconds=round(detail_elapsed, 3),
+                )
+                return
             yield emit(
                 "progress",
                 message=(
@@ -467,6 +555,32 @@ def _stream_rewrite_selected(payload: dict[str, Any]):
                 source_image_count=len(source_images),
                 elapsed_seconds=round(detail_elapsed, 3),
             )
+
+            ocr_started_at = time.monotonic()
+            if source_images:
+                yield emit(
+                    "progress",
+                    message=f"正在用 pdf-image-text-extractor 图文解析能力提取《{content.title}》图片文字...",
+                    phase="image-ocr",
+                    elapsed_seconds=0,
+                )
+            content, image_text_evidence = yield from _run_with_stream_progress(
+                lambda: _augment_content_with_image_text(content),
+                emit=emit,
+                waiting_message=lambda elapsed: f"正在提取《{content.title}》图片文字，已耗时 {elapsed}。",
+                progress_phase="image-ocr" if source_images else None,
+            )
+            ocr_elapsed = time.monotonic() - ocr_started_at
+            source_text_length = len(content.text or "")
+            if source_images:
+                yield emit(
+                    "progress",
+                    message=f"图片文字处理完成：{image_text_evidence.get('message')} 用时 {_format_elapsed(ocr_elapsed)}。",
+                    article_title=content.title,
+                    source_text_length=source_text_length,
+                    image_text_evidence=image_text_evidence,
+                    elapsed_seconds=round(ocr_elapsed, 3),
+                )
 
             trend = TrendCluster(
                 trend_id=f"selected-{content.content_id}",
@@ -515,6 +629,7 @@ def _stream_rewrite_selected(payload: dict[str, Any]):
                 "url": content.url,
                 "source_text_length": source_text_length,
                 "rewrite_text_length": rewrite_text_length,
+                "image_text_evidence": image_text_evidence,
                 "article_compliance": rewrite_update.get("article_compliance"),
                 "quality_flags": review_update.get("quality_flags", []),
                 "quality_info": review_update.get("quality_info", []),
@@ -522,6 +637,7 @@ def _stream_rewrite_selected(payload: dict[str, Any]):
                 "human_review_required": bool(review_update.get("human_review_required")),
                 "stage_timings": {
                     "full_text_seconds": round(detail_elapsed, 3),
+                    "image_ocr_seconds": round(ocr_elapsed, 3),
                     "rewrite_seconds": round(rewrite_elapsed, 3),
                     "quality_check_seconds": round(review_elapsed, 3),
                     "total_seconds": round(total_elapsed, 3),
@@ -2961,6 +3077,122 @@ def _source_image_urls(payload: Any) -> list[str]:
     return result[:12]
 
 
+def _augment_content_with_image_text(content: NormalizedContent) -> tuple[NormalizedContent, dict[str, Any]]:
+    image_urls = _source_image_urls(content.raw_payload)
+    evidence: dict[str, Any] = {
+        "status": "no_images" if not image_urls else "skipped",
+        "image_count": len(image_urls),
+        "processed_image_count": 0,
+        "items": [],
+        "text": "",
+        "message": "原文没有图片，无需 OCR。",
+    }
+    if not image_urls:
+        return content, evidence
+    if not _image_ocr_enabled():
+        evidence["message"] = "未配置视觉 OCR，已跳过图片文字提取。"
+        return content, evidence
+
+    max_images = max(1, int(os.getenv("WECHAT_IMAGE_OCR_MAX_IMAGES", "3")))
+    items: list[dict[str, Any]] = []
+    for index, image_url in enumerate(image_urls[:max_images], start=1):
+        text, error = _extract_image_text_with_qwen(image_url, title=content.title)
+        item = {"index": index, "image_url": image_url, "text": text, "error": error}
+        items.append(item)
+
+    extracted = [item["text"].strip() for item in items if item.get("text")]
+    evidence.update(
+        {
+            "status": "extracted" if extracted else "empty",
+            "processed_image_count": len(items),
+            "items": items,
+            "text": "\n\n".join(extracted),
+            "message": (
+                f"已从 {len(extracted)} / {len(items)} 张图片提取文字。"
+                if extracted
+                else f"已检查 {len(items)} 张图片，未提取到可用文字。"
+            ),
+        }
+    )
+    if not extracted:
+        return content, evidence
+
+    appended_text = (
+        f"{content.text or ''}\n\n"
+        "【图片文字 OCR 补充证据】\n"
+        + "\n\n".join(f"- 图片 {item['index']}：{item['text'].strip()}" for item in items if item.get("text"))
+    ).strip()
+    raw_payload = dict(content.raw_payload or {})
+    raw_payload["image_text_evidence"] = evidence
+    return replace(content, text=appended_text, raw_payload=raw_payload), evidence
+
+
+def _image_ocr_enabled() -> bool:
+    if os.getenv("WECHAT_IMAGE_OCR_ENABLED", "1").lower() in {"0", "false", "no"}:
+        return False
+    api_key = os.getenv("QWEN_VISION_API_KEY") or os.getenv("QWEN_API_KEY") or os.getenv("DASHSCOPE_API_KEY")
+    return bool(api_key and not api_key.startswith("your_"))
+
+
+def _extract_image_text_with_qwen(image_url: str, *, title: str) -> tuple[str, str | None]:
+    api_key = os.getenv("QWEN_VISION_API_KEY") or os.getenv("QWEN_API_KEY") or os.getenv("DASHSCOPE_API_KEY")
+    if not api_key:
+        return "", "missing QWEN_VISION_API_KEY/QWEN_API_KEY/DASHSCOPE_API_KEY"
+    base_url = os.getenv("QWEN_VISION_BASE_URL", os.getenv("QWEN_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1")).rstrip("/") + "/"
+    model = os.getenv("QWEN_VISION_MODEL", "qwen-vl-max-latest")
+    timeout = int(os.getenv("QWEN_VISION_TIMEOUT_SECONDS", "60"))
+    payload = {
+        "model": model,
+        "temperature": 0,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": (
+                            "请只提取这张微信公众号文章图片里的可见中文/英文文字。"
+                            f"文章标题：{title}。"
+                            "如果没有文字，输出空字符串；不要解释，不要编造。"
+                        ),
+                    },
+                    {"type": "image_url", "image_url": {"url": image_url}},
+                ],
+            }
+        ],
+    }
+    request = Request(
+        urljoin(base_url, "chat/completions"),
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers={
+            "Accept": "application/json",
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urlopen(request, timeout=timeout) as response:
+            body = response.read().decode("utf-8")
+        data = json.loads(body)
+        choices = data.get("choices") or []
+        message = choices[0].get("message", {}) if choices else {}
+        content = message.get("content")
+        if isinstance(content, list):
+            text = "\n".join(str(part.get("text") or "") for part in content if isinstance(part, dict))
+        else:
+            text = str(content or "")
+        text = text.strip().strip('"').strip()
+        if text in {"空字符串", "无", "没有文字", "无文字"}:
+            text = ""
+        return text[:2000], None
+    except HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        return "", f"HTTP {exc.code}: {detail[:200]}"
+    except (TimeoutError, URLError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        return "", str(exc)[:200]
+
+
 def _cached_workflow_state(*, refresh: bool, cache_only: bool = False) -> HotspotState | None:
     now = datetime.now(timezone.utc)
     expires_at = _WORKFLOW_CACHE.get("expires_at")
@@ -3085,6 +3317,14 @@ def _delete_previous_wechat_download_cache(*, now: datetime | None = None) -> di
                 if _delete_cache_file(path):
                     article_list_deleted += 1
 
+    article_detail_deleted = 0
+    if ARTICLE_DETAIL_CACHE_DIR.exists():
+        for path in ARTICLE_DETAIL_CACHE_DIR.glob("*.json"):
+            cached_at = _cached_at_from_json_file(path)
+            if cached_at is None or cached_at.date() < today:
+                if _delete_cache_file(path):
+                    article_detail_deleted += 1
+
     workflow_cache_deleted = 0
     cached_at = _cached_at_from_json_file(WORKFLOW_CACHE_FILE)
     if cached_at is None or cached_at.date() < today:
@@ -3094,6 +3334,7 @@ def _delete_previous_wechat_download_cache(*, now: datetime | None = None) -> di
     _WORKFLOW_CACHE["expires_at"] = None
     return {
         "article_list_cache_deleted": article_list_deleted,
+        "article_detail_cache_deleted": article_detail_deleted,
         "workflow_cache_deleted": workflow_cache_deleted,
     }
 
@@ -3210,27 +3451,82 @@ def _review_flags_from_quality_flags(quality_flags: list[str]) -> list[str]:
 
 def _rewrite_candidates(state: HotspotState, limit: int = 20) -> list[dict[str, Any]]:
     contents = {content.content_id: content for content in state.get("normalized_contents", [])}
-    rows: list[dict[str, Any]] = []
+    rows_by_id: dict[str, dict[str, Any]] = {}
     scores = state.get("hotness_scores", [])
-    used_content_ids: set[str] = set()
-    for score in scores[:limit]:
+    for score in scores:
         content = contents.get(score.content_id)
         if content is None or not _is_valid_wechat_candidate(content):
             continue
-        used_content_ids.add(content.content_id)
-        rows.append(_candidate_row(content, score.hotness_score, rank=len(rows) + 1, total=limit))
-    if len(rows) >= limit:
-        return rows
+        rows_by_id[content.content_id] = _candidate_row(content, score.hotness_score, rank=0, total=limit)
 
     fallback_contents = [
         content
         for content in state.get("normalized_contents", [])
-        if _is_valid_wechat_candidate(content) and content.content_id not in used_content_ids
+        if _is_valid_wechat_candidate(content) and content.content_id not in rows_by_id
     ]
     fallback_contents.sort(key=_content_recency_timestamp, reverse=True)
-    for content in fallback_contents[: max(0, limit - len(rows))]:
-        rows.append(_candidate_row(content, _fallback_candidate_score(content), rank=len(rows) + 1, total=limit))
+    for content in fallback_contents:
+        rows_by_id[content.content_id] = _candidate_row(content, _fallback_candidate_score(content), rank=0, total=limit)
+    rows = list(rows_by_id.values())
+    rows.sort(
+        key=lambda item: (
+            float(item.get("ai_hot_score") or 0),
+            1 if item.get("readiness") == "ready" else 0,
+            float(item.get("hotness_score") or 0),
+            int(item.get("reads") or 0),
+        ),
+        reverse=True,
+    )
+    rows = rows[:limit]
+    for index, row in enumerate(rows, start=1):
+        row["rank"] = index
+        row["light"] = _candidate_light(index, limit, float(row.get("ai_hot_score") or row.get("hotness_score") or 0))
     return rows
+
+
+def _wechat_10w_hot_candidates(state: HotspotState, limit: int = 20) -> list[dict[str, Any]]:
+    rows = _rewrite_candidates(state, limit=max(limit, 100))
+    rows.sort(key=_wechat_10w_hot_sort_key, reverse=True)
+    rows = rows[: max(1, limit)]
+    for index, row in enumerate(rows, start=1):
+        reads = _int_or_none(row.get("reads"))
+        hot_score = float(row.get("ai_hot_score") or row.get("hotness_score") or 0)
+        row["rank"] = index
+        row["hot_rank"] = index
+        row["source"] = "wechat-10w-hot"
+        row["hot_badge"] = _wechat_10w_hot_badge(reads, hot_score)
+        row["hot_reason"] = _wechat_10w_hot_reason(reads, hot_score)
+        row["light"] = _candidate_light(index, limit, hot_score)
+    return rows
+
+
+def _wechat_10w_hot_sort_key(item: dict[str, Any]) -> tuple[int, int, float, float]:
+    reads = _int_or_none(item.get("reads"))
+    has_reads = 1 if reads is not None else 0
+    return (
+        has_reads,
+        reads or 0,
+        float(item.get("ai_hot_score") or 0),
+        float(item.get("hotness_score") or 0),
+    )
+
+
+def _wechat_10w_hot_badge(reads: int | None, hot_score: float) -> str:
+    if reads is not None and reads >= 100000:
+        return "10w+"
+    if reads is not None and reads >= 50000:
+        return "准10w"
+    if reads is not None:
+        return "本地热文"
+    if hot_score >= 70:
+        return "AI热榜"
+    return "候选热文"
+
+
+def _wechat_10w_hot_reason(reads: int | None, hot_score: float) -> str:
+    if reads is not None:
+        return f"按阅读量 {reads} 和 AI 热度 {hot_score:.1f} 排序。"
+    return "当前 wechat-download-api 未返回阅读量，按 AI 热度和本地热度排序。"
 
 
 def _is_valid_wechat_candidate(content: NormalizedContent) -> bool:
@@ -3248,18 +3544,89 @@ def _is_valid_wechat_candidate(content: NormalizedContent) -> bool:
 
 def _candidate_row(content: NormalizedContent, hotness_score: float, *, rank: int, total: int) -> dict[str, Any]:
     metrics = content.metrics
+    reads = metrics.reads if metrics.reads is not None else metrics.views
+    image_count = len(_source_image_urls(content.raw_payload))
+    readiness, readiness_label, readiness_detail = _candidate_readiness(content)
+    ai_signals = _ai_knowledge_signals(content)
+    ai_hot_score = _ai_hot_candidate_score(content, hotness_score, ai_signals, readiness)
     return {
         "rank": rank,
         "content_id": content.content_id,
-        "light": _candidate_light(rank, total, hotness_score),
+        "light": _candidate_light(rank, total, ai_hot_score),
         "title": content.title,
         "author": content.author or _author_from_payload(content.raw_payload),
         "hotness_score": round(hotness_score, 2),
-        "reads": metrics.reads or metrics.views or 0,
-        "likes": metrics.likes or 0,
-        "comments": metrics.comments or 0,
+        "ai_hot_score": round(ai_hot_score, 2),
+        "ai_relevance_score": round(ai_signals["ai_relevance_score"], 2),
+        "knowledge_score": round(ai_signals["knowledge_score"], 2),
+        "matched_keywords": ai_signals["matched_keywords"],
+        "knowledge_signals": ai_signals["knowledge_signals"],
+        "readiness": readiness,
+        "readiness_label": readiness_label,
+        "readiness_detail": readiness_detail,
+        "image_count": image_count,
+        "has_images": image_count > 0,
+        "reads": reads,
+        "likes": metrics.likes,
+        "comments": metrics.comments,
         "url": content.url,
     }
+
+
+def _ai_knowledge_signals(content: NormalizedContent) -> dict[str, Any]:
+    source = f"{content.title} {content.author or ''} {content.text or ''}".lower()
+    matched_keywords = _matched_keywords(source, AI_KNOWLEDGE_KEYWORDS)
+    knowledge_signals = _matched_keywords(source, KNOWLEDGE_SIGNAL_KEYWORDS)
+    title_source = (content.title or "").lower()
+    title_ai_matches = _matched_keywords(title_source, AI_KNOWLEDGE_KEYWORDS)
+    title_knowledge_matches = _matched_keywords(title_source, KNOWLEDGE_SIGNAL_KEYWORDS)
+    return {
+        "matched_keywords": matched_keywords[:8],
+        "knowledge_signals": knowledge_signals[:8],
+        "ai_relevance_score": min(40.0, len(matched_keywords) * 5.0 + len(title_ai_matches) * 6.0),
+        "knowledge_score": min(25.0, len(knowledge_signals) * 3.5 + len(title_knowledge_matches) * 4.0),
+    }
+
+
+def _matched_keywords(source: str, keywords: tuple[str, ...]) -> list[str]:
+    normalized = source.lower()
+    return [keyword for keyword in keywords if keyword.lower() in normalized]
+
+
+def _ai_hot_candidate_score(
+    content: NormalizedContent,
+    hotness_score: float,
+    signals: dict[str, Any],
+    readiness: str,
+) -> float:
+    metrics = content.metrics
+    reads = float(metrics.reads or metrics.views or 0)
+    near_100k_bonus = min(20.0, reads / 5000.0)
+    engagement_bonus = min(8.0, float((metrics.likes or 0) + (metrics.comments or 0)) / 100.0)
+    image_bonus = min(4.0, len(_source_image_urls(content.raw_payload)) * 1.0)
+    readiness_bonus = {"ready": 8.0, "short": 2.0, "missing": -12.0}.get(readiness, -6.0)
+    return max(
+        0.0,
+        min(
+            100.0,
+            float(hotness_score) * 0.35
+            + float(signals["ai_relevance_score"])
+            + float(signals["knowledge_score"])
+            + near_100k_bonus
+            + engagement_bonus
+            + image_bonus
+            + readiness_bonus,
+        ),
+    )
+
+
+def _candidate_readiness(content: NormalizedContent) -> tuple[str, str, str]:
+    text_length = len((content.text or "").strip())
+    if text_length >= 800:
+        return "ready", "全文就绪", f"缓存正文约 {text_length} 字，可直接改写"
+    if text_length >= 200:
+        return "short", "需补全文", f"缓存正文约 {text_length} 字，改写前会补拉全文"
+    return "missing", "待补全文", "缓存正文不足，改写前会从原文链接补拉"
 
 
 def _fallback_candidate_score(content: NormalizedContent) -> float:
@@ -3288,6 +3655,7 @@ def _rewrite_selected_article(state: HotspotState, content_id: str) -> tuple[Gen
     if content is None:
         return None, {}
     content = _enrich_content_detail(content)
+    content, image_text_evidence = _augment_content_with_image_text(content)
     trend = TrendCluster(
         trend_id=f"selected-{content.content_id}",
         name=_selected_topic(content.title),
@@ -3313,6 +3681,7 @@ def _rewrite_selected_article(state: HotspotState, content_id: str) -> tuple[Gen
         "title": content.title,
         "author": content.author,
         "url": content.url,
+        "image_text_evidence": image_text_evidence,
         "article_compliance": rewrite_update.get("article_compliance"),
         "quality_flags": review_update.get("quality_flags", []),
         "quality_info": review_update.get("quality_info", []),
@@ -3368,11 +3737,27 @@ def _int_or_none(value: Any) -> int | None:
 
 
 def _enrich_content_detail(content):
+    enriched, _status = _enrich_content_detail_with_status(content)
+    return enriched
+
+
+def _enrich_content_detail_with_status(content) -> tuple[NormalizedContent, dict[str, Any]]:
+    initial_length = len((content.text or "").strip())
     if not content.url or len((content.text or "").strip()) >= 200:
-        return content
+        return content, {
+            "status": "ready" if initial_length >= 200 else "missing_url",
+            "initial_text_length": initial_length,
+            "final_text_length": initial_length,
+            "message": "缓存正文已足够。" if initial_length >= 200 else "候选没有原文链接，无法补拉全文。",
+        }
     client = WechatDownloadApiClient.from_env()
     if client is None:
-        return content
+        return content, {
+            "status": "missing_client",
+            "initial_text_length": initial_length,
+            "final_text_length": initial_length,
+            "message": "未配置 wechat-download-api 客户端。",
+        }
     try:
         raw_contents = client.fetch(
             SourcePlan(
@@ -3382,16 +3767,31 @@ def _enrich_content_detail(content):
                 metadata={"url": content.url},
             )
         )
-    except RuntimeError:
-        return content
+    except RuntimeError as exc:
+        return content, {
+            "status": "fetch_failed",
+            "initial_text_length": initial_length,
+            "final_text_length": initial_length,
+            "message": _clean_subprocess_error(exc),
+        }
     if not raw_contents:
-        return content
+        return content, {
+            "status": "empty_detail",
+            "initial_text_length": initial_length,
+            "final_text_length": initial_length,
+            "message": "文章详情接口没有返回可用内容。",
+        }
     update = NormalizationAgent().invoke({"raw_contents": raw_contents})
     details = update.get("normalized_contents", [])
     if not details:
-        return content
+        return content, {
+            "status": "normalization_empty",
+            "initial_text_length": initial_length,
+            "final_text_length": initial_length,
+            "message": "文章详情返回后归一化为空。",
+        }
     detail = details[0]
-    return replace(
+    enriched = replace(
         content,
         title=detail.title or content.title,
         text=detail.text or content.text,
@@ -3399,6 +3799,17 @@ def _enrich_content_detail(content):
         url=detail.url or content.url,
         raw_payload={**content.raw_payload, "detail": detail.raw_payload},
     )
+    final_length = len((enriched.text or "").strip())
+    return enriched, {
+        "status": "ready" if final_length >= 200 else "short_after_detail",
+        "initial_text_length": initial_length,
+        "final_text_length": final_length,
+        "message": (
+            f"详情补拉成功，正文 {final_length} 字。"
+            if final_length >= 200
+            else f"详情接口返回后正文仍只有 {final_length} 字。"
+        ),
+    }
 
 
 def _score_for_content(state: HotspotState, content_id: str) -> float:
@@ -3533,7 +3944,7 @@ def _rewrite_workspace_html() -> str:
 <body>
   <main>
     <h1>微信热点改写工作台</h1>
-    <p class="muted">流程：Agent 拉取公众号热度文章 -> 红黄绿灯提示选择 -> 把选中文章交给 wechat-rewrite skill 生成可发布稿。</p>
+    <p class="muted">流程：发现 AI 知识型高热公众号文章 -> 人工选择 -> 图文 OCR 证据增强 -> 流式交给 wechat-rewrite Agent 生成可发布稿。</p>
     <div class="workspace-links">
       <a href="/workflow/video/agent" target="_blank">视频 Agent 任务入口</a>
       <a href="/workflow/video/agent/run/stream" target="_blank">视频流式处理页</a>
@@ -3541,9 +3952,9 @@ def _rewrite_workspace_html() -> str:
     </div>
 
     <div class="steps">
-      <div class="step"><strong>1. 发现热点</strong><br>从 LangGraph 多智能体结果中读取微信热度文章。</div>
-      <div class="step"><strong>2. 人工选择</strong><br>绿灯优先，黄灯可观察，红灯不建议优先改写。</div>
-      <div class="step"><strong>3. Agent 改写</strong><br>选中一篇文章后，调用微信改写 Agent 生成发布稿。</div>
+      <div class="step"><strong>1. 发现 AI 热文</strong><br>优先排序 AI 相关、知识性强、阅读接近 10w+ 的公众号文章。</div>
+      <div class="step"><strong>2. 人工选择</strong><br>查看知识信号、全文状态和图片数，再选择要改写的文章。</div>
+      <div class="step"><strong>3. OCR 增强改写</strong><br>原文有图片时先尝试提取图片文字，再调用微信改写 Agent。</div>
     </div>
 
     <section class="panel notice">
@@ -3566,6 +3977,7 @@ def _rewrite_workspace_html() -> str:
           <h2 style="margin-right:auto;">热度公众号文章</h2>
           <button id="manual-subscription-refresh-btn" onclick="manualRefreshSubscriptions()">手动更新订阅号文章</button>
           <button class="secondary" onclick="loadCandidates(true)">重新拉取</button>
+          <button class="secondary" onclick="loadHotCandidates(false)">wechat-10w-hot 高热榜</button>
         </div>
         <p id="status" class="muted">正在加载候选文章...</p>
         <p class="muted">手动更新会先删除前一天及更早的下载缓存，并在下方实时显示清理和拉取已耗时。</p>
@@ -3574,7 +3986,7 @@ def _rewrite_workspace_html() -> str:
           <table>
             <thead>
               <tr>
-                <th>灯</th><th>排名</th><th>标题</th><th>公众号</th><th>热度</th><th>阅读</th><th>操作</th>
+                <th>灯</th><th>排名</th><th>标题</th><th>公众号</th><th>AI热度</th><th>阅读</th><th>状态/图片</th><th>操作</th>
               </tr>
             </thead>
             <tbody id="candidate-body"></tbody>
@@ -3595,7 +4007,7 @@ def _rewrite_workspace_html() -> str:
   <script>
     const lightLabels = { green: "绿灯", yellow: "黄灯", red: "红灯" };
     const candidatesById = new Map();
-    const candidateCacheKey = "langgraph-study:rewrite:candidates:v3";
+    const candidateCacheKey = "langgraph-study:rewrite:candidates:v4";
     const autoBackgroundRefresh = false;
     let currentArticleMarkdown = "";
     let currentSourceImages = [];
@@ -3607,6 +4019,7 @@ def _rewrite_workspace_html() -> str:
     let activeRewriteTimerId = null;
     let activeRewriteTimerStartMs = 0;
     let activeRewriteTimerItem = null;
+    let currentCandidateMode = "candidates";
 
     async function loadCandidates(refresh = false) {
       const showedLocalCache = !refresh && renderCachedCandidates();
@@ -3625,6 +4038,7 @@ def _rewrite_workspace_html() -> str:
         setStatus("暂无服务端缓存。请点击“重新拉取”获取公众号文章。");
         return;
       }
+      currentCandidateMode = "candidates";
       renderCandidates(items);
       if (items.length > 0) {
         cacheCandidates(data);
@@ -3633,6 +4047,19 @@ def _rewrite_workspace_html() -> str:
       if (!refresh && autoBackgroundRefresh) {
         refreshCandidatesInBackground();
       }
+    }
+
+    async function loadHotCandidates(refresh = false) {
+      setStatus(refresh ? "正在刷新 wechat-10w-hot 高热榜..." : "正在读取 wechat-10w-hot 高热榜...");
+      const data = await fetchJson(`/workflow/rewrite/hot-candidates?refresh=${refresh ? "true" : "false"}&cache_only=${refresh ? "false" : "true"}&limit=20`);
+      const items = data.items || [];
+      currentCandidateMode = "hot";
+      renderCandidates(items);
+      if (items.length > 0) {
+        cacheCandidates({ ...data, items });
+      }
+      const note = data.summary && data.summary.hot_rank_note ? ` ${data.summary.hot_rank_note}` : "";
+      setStatus(`已用 wechat-10w-hot 生成高热榜 ${items.length} 篇。${note}`);
     }
 
     async function refreshCandidatesInBackground() {
@@ -3713,7 +4140,11 @@ def _rewrite_workspace_html() -> str:
       }
       if (event.event === "done" && event.result) {
         const items = event.result.items || [];
-        renderCandidates(items);
+        if (currentCandidateMode === "hot") {
+          loadHotCandidates(false);
+        } else {
+          renderCandidates(items);
+        }
         if (items.length > 0) cacheCandidates({ items, summary: event.result.summary || {}, cached: false });
       }
       if (event.event === "error") {
@@ -3817,14 +4248,40 @@ def _rewrite_workspace_html() -> str:
         tr.innerHTML = `
           <td><span class="light ${item.light}"><span class="dot"></span>${lightLabels[item.light]}</span></td>
           <td>${item.rank}</td>
-          <td class="title-cell"><strong>${escapeHtml(item.title || "")}</strong><br>${item.url ? `<a href="${item.url}" target="_blank">原文</a>` : `<span class="muted">无原文链接</span>`}</td>
+          <td class="title-cell">
+            <strong>${escapeHtml(item.title || "")}</strong>
+            <br>${item.url ? `<a href="${item.url}" target="_blank">原文</a>` : `<span class="muted">无原文链接</span>`}
+            <br><span class="muted">${formatSignals(item)}</span>
+          </td>
           <td>${escapeHtml(item.author || "未知")}</td>
-          <td>${item.hotness_score}</td>
-          <td>${item.reads || 0}</td>
+          <td>${item.ai_hot_score || item.hotness_score}<br><span class="muted">原热度 ${item.hotness_score}</span></td>
+          <td>${formatMetric(item.reads)}</td>
+          <td>
+            ${escapeHtml(item.hot_badge || item.readiness_label || "待检查")}
+            <br><span class="muted">${escapeHtml(item.hot_reason || `${item.image_count || 0} 张图`)}</span>
+          </td>
           <td><button onclick="rewriteSelected('${item.content_id}')">选择改写</button></td>
         `;
         tbody.appendChild(tr);
       }
+    }
+
+    function formatMetric(value) {
+      if (value === null || value === undefined || value === "") return "未知";
+      const number = Number(value);
+      if (!Number.isFinite(number)) return escapeHtml(String(value));
+      if (number >= 10000) return `${(number / 10000).toFixed(number >= 100000 ? 0 : 1)}万`;
+      return String(number);
+    }
+
+    function formatSignals(item) {
+      const keywords = Array.isArray(item.matched_keywords) ? item.matched_keywords.slice(0, 4) : [];
+      const knowledge = Array.isArray(item.knowledge_signals) ? item.knowledge_signals.slice(0, 3) : [];
+      const parts = [];
+      if (keywords.length) parts.push(`AI: ${keywords.join(" / ")}`);
+      if (knowledge.length) parts.push(`知识: ${knowledge.join(" / ")}`);
+      if (item.readiness_detail) parts.push(item.readiness_detail);
+      return parts.join("；") || "暂无明显 AI 知识信号";
     }
 
     async function rewriteSelected(contentId) {
@@ -3881,7 +4338,7 @@ def _rewrite_workspace_html() -> str:
 
     function handleRewriteStreamEvent(event, requestId) {
       if (requestId !== activeRewriteRequestId) return;
-      if (event.phase === "rewrite-detail" || event.phase === "rewriting") {
+      if (event.phase === "rewrite-detail" || event.phase === "image-ocr" || event.phase === "rewriting") {
         updateRewriteElapsedProgress(event.message || "正在处理选中文章...", event.elapsed_seconds || 0);
         return;
       }

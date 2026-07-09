@@ -103,6 +103,40 @@ class WechatDownloadApiClientTest(unittest.TestCase):
         self.assertEqual(raw.raw_payload["metrics"]["reads"], 1024)
         self.assertEqual(raw.raw_payload["account"]["fakeid"], "fake_123")
 
+    def test_article_metrics_accept_wechat_stat_field_variants(self) -> None:
+        client = FakeWechatDownloadApiClient(
+            get_responses={
+                "/api/public/articles/search": [
+                    {
+                        "data": {
+                            "app_msg_list": [
+                                {
+                                    "appmsgid": "msg_1",
+                                    "title": "AI Agent 产品观察",
+                                    "link": "https://mp.weixin.qq.com/s/msg_1",
+                                    "plain_content": "智能体产品正在升温",
+                                    "publish_time": "2026-06-17",
+                                    "appmsgstat": {
+                                        "read_num": "10万+",
+                                        "like_num": "1.2万",
+                                        "comment_count": "345",
+                                    },
+                                }
+                            ]
+                        }
+                    }
+                ],
+            }
+        )
+        client.default_fakeids = ["fake_123"]
+        plan = SourcePlan(platform=Platform.WECHAT, dimension=ApiDimension.SEARCH_QUERY, query="AI Agent", page_size=10)
+
+        [raw] = client.fetch(plan)
+
+        self.assertEqual(raw.raw_payload["metrics"]["reads"], 100000)
+        self.assertEqual(raw.raw_payload["metrics"]["likes"], 12000)
+        self.assertEqual(raw.raw_payload["metrics"]["comments"], 345)
+
     def test_search_query_backfills_account_name_from_discovered_fakeid(self) -> None:
         client = FakeWechatDownloadApiClient(
             get_responses={
@@ -272,6 +306,30 @@ class WechatDownloadApiClientTest(unittest.TestCase):
                 )
             ],
         )
+
+    def test_subscription_fetch_excludes_red_fox_accounts_before_article_requests(self) -> None:
+        client = FakeWechatDownloadApiClient(
+            get_responses={
+                "/api/rss/subscriptions": [
+                    {
+                        "list": [
+                            {"fakeid": "abcdefghijkl=", "nickname": "红狐 AI"},
+                            {"fakeid": "mnopqrstuvwx=", "nickname": "AI 前沿"},
+                        ]
+                    }
+                ],
+                "/api/public/articles": [
+                    {"list": []},
+                ],
+            }
+        )
+
+        with patch.dict(os.environ, {"WECHAT_ARTICLE_LIST_CACHE": "0"}):
+            client.fetch_subscription_articles(account_limit=0)
+
+        article_calls = [call for call in client.get_calls if call[0] == "/api/public/articles"]
+        self.assertEqual(len(article_calls), 1)
+        self.assertEqual(article_calls[0][1]["fakeid"], "mnopqrstuvwx=")
 
 
 class WechatDownloadCollectionAgentTest(unittest.TestCase):

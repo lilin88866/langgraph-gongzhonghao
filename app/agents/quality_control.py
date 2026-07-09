@@ -66,5 +66,7 @@ def _article_review_flags(article_compliance: object) -> list[str]:
         return []
     if article_compliance.get("compliant") is False:
         similarity = article_compliance.get("similarity")
-        return [f"article_similarity_too_high:{similarity}%"]
+        max_similarity = article_compliance.get("max_similarity") or article_compliance.get("threshold")
+        if isinstance(similarity, (int, float)) and isinstance(max_similarity, (int, float)) and similarity > max_similarity:
+            return [f"article_similarity_too_high:{similarity}%"]
     return []

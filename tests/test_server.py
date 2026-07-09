@@ -16,10 +16,13 @@ try:
         _image_prompt_from_text,
         _image_urls_from_output,
         _rewrite_candidates,
+        _wechat_10w_hot_candidates,
+        _enrich_content_detail_with_status,
         _rewrite_selected_article,
         _video_workspace_html,
         _rewrite_workspace_html,
         _allow_stale_candidate_rewrite,
+        _augment_content_with_image_text,
         _delete_previous_wechat_download_cache,
         _save_workflow_state_cache,
         _should_auto_start_ollama,
@@ -55,10 +58,13 @@ except ImportError:  # pragma: no cover - optional server extra may be absent lo
     _image_prompt_from_text = None
     _image_urls_from_output = None
     _rewrite_candidates = None
+    _wechat_10w_hot_candidates = None
+    _enrich_content_detail_with_status = None
     _rewrite_selected_article = None
     _video_workspace_html = None
     _rewrite_workspace_html = None
     _allow_stale_candidate_rewrite = None
+    _augment_content_with_image_text = None
     _delete_previous_wechat_download_cache = None
     _save_workflow_state_cache = None
     _should_auto_start_ollama = None
@@ -161,6 +167,92 @@ class ServerTest(unittest.TestCase):
         self.assertEqual(candidate["light"], "green")
         self.assertEqual(candidate["title"], "AI 工作流文章")
         self.assertEqual(candidate["reads"], 12000)
+        self.assertIn("ai_hot_score", candidate)
+        self.assertIn("ai", candidate["matched_keywords"])
+        self.assertEqual(candidate["readiness"], "missing")
+
+    def test_rewrite_candidates_prioritize_ai_knowledge_hot_articles(self) -> None:
+        state = {
+            "normalized_contents": [
+                NormalizedContent(
+                    platform=Platform.WECHAT,
+                    content_id="general-hot",
+                    author="科技号",
+                    title="普通科技新闻",
+                    text="这是一篇普通科技新闻。" * 80,
+                    media_type=MediaType.ARTICLE,
+                    published_at=None,
+                    metrics=EngagementMetrics(reads=95000, likes=100),
+                    url="https://mp.weixin.qq.com/s/general",
+                    source_api="wechat-download-api",
+                    raw_payload={},
+                ),
+                NormalizedContent(
+                    platform=Platform.WECHAT,
+                    content_id="ai-knowledge",
+                    author="AI 知识号",
+                    title="AI Agent 架构实践指南",
+                    text="本文拆解大模型 Agent 工具调用、RAG 流程和实践方法。" * 80,
+                    media_type=MediaType.ARTICLE,
+                    published_at=None,
+                    metrics=EngagementMetrics(reads=60000, likes=300),
+                    url="https://mp.weixin.qq.com/s/ai",
+                    source_api="wechat-download-api",
+                    raw_payload={"image_urls": ["https://mmbiz.qpic.cn/demo.jpg"]},
+                ),
+            ],
+            "hotness_scores": [
+                HotnessScore(
+                    content_id="general-hot",
+                    hotness_score=92.0,
+                    velocity_score=40.0,
+                    engagement_quality_score=30.0,
+                    platform_weight=1.0,
+                    reason="普通高热",
+                ),
+                HotnessScore(
+                    content_id="ai-knowledge",
+                    hotness_score=80.0,
+                    velocity_score=35.0,
+                    engagement_quality_score=25.0,
+                    platform_weight=1.0,
+                    reason="AI 知识",
+                ),
+            ],
+        }
+
+        candidates = _rewrite_candidates(state)
+
+        self.assertEqual(candidates[0]["content_id"], "ai-knowledge")
+        self.assertGreater(candidates[0]["ai_hot_score"], candidates[1]["ai_hot_score"])
+        self.assertEqual(candidates[0]["readiness"], "ready")
+        self.assertEqual(candidates[0]["image_count"], 1)
+
+    def test_image_text_evidence_is_appended_to_selected_content(self) -> None:
+        content = NormalizedContent(
+            platform=Platform.WECHAT,
+            content_id="content-1",
+            author="AI 公众号",
+            title="AI 图片文章",
+            text="正文已有文本。",
+            media_type=MediaType.ARTICLE,
+            published_at=None,
+            metrics=EngagementMetrics(reads=1000),
+            url="https://mp.weixin.qq.com/s/demo",
+            source_api="wechat-download-api",
+            raw_payload={"image_urls": ["https://mmbiz.qpic.cn/demo.jpg"]},
+        )
+
+        with (
+            patch("app.server._image_ocr_enabled", return_value=True),
+            patch("app.server._extract_image_text_with_qwen", return_value=("图片里的关键流程：检索、生成、校验。", None)),
+        ):
+            augmented, evidence = _augment_content_with_image_text(content)
+
+        self.assertIn("【图片文字 OCR 补充证据】", augmented.text)
+        self.assertIn("检索、生成、校验", augmented.text)
+        self.assertEqual(evidence["status"], "extracted")
+        self.assertEqual(evidence["processed_image_count"], 1)
 
     def test_rewrite_candidates_skip_wechat_account_results(self) -> None:
         state = {
@@ -192,6 +284,98 @@ class ServerTest(unittest.TestCase):
         }
 
         self.assertEqual(_rewrite_candidates(state), [])
+
+    def test_rewrite_candidates_keep_missing_reads_unknown(self) -> None:
+        state = {
+            "normalized_contents": [
+                NormalizedContent(
+                    platform=Platform.WECHAT,
+                    content_id="content-1",
+                    author="AI 公众号",
+                    title="没有统计字段的文章",
+                    text="AI Agent 实践指南。" * 80,
+                    media_type=MediaType.ARTICLE,
+                    published_at=None,
+                    metrics=EngagementMetrics(),
+                    url="https://mp.weixin.qq.com/s/no-metrics",
+                    source_api="wechat-download-api",
+                    raw_payload={},
+                )
+            ],
+            "hotness_scores": [
+                HotnessScore(
+                    content_id="content-1",
+                    hotness_score=22.0,
+                    velocity_score=0.0,
+                    engagement_quality_score=0.0,
+                    platform_weight=1.0,
+                    reason="无统计字段",
+                )
+            ],
+        }
+
+        [candidate] = _rewrite_candidates(state)
+
+        self.assertIsNone(candidate["reads"])
+        self.assertIsNone(candidate["likes"])
+        self.assertIsNone(candidate["comments"])
+
+    def test_wechat_10w_hot_candidates_rank_reads_then_ai_heat(self) -> None:
+        state = {
+            "normalized_contents": [
+                NormalizedContent(
+                    platform=Platform.WECHAT,
+                    content_id="known-reads",
+                    author="AI 公众号",
+                    title="阅读量明确的 AI 文章",
+                    text="AI Agent 实践指南。" * 80,
+                    media_type=MediaType.ARTICLE,
+                    published_at=None,
+                    metrics=EngagementMetrics(reads=12000, likes=20),
+                    url="https://mp.weixin.qq.com/s/known",
+                    source_api="wechat-download-api",
+                    raw_payload={},
+                ),
+                NormalizedContent(
+                    platform=Platform.WECHAT,
+                    content_id="unknown-reads",
+                    author="AI 公众号",
+                    title="AI Agent 架构实践指南",
+                    text="本文拆解大模型 Agent 工具调用、RAG 流程和实践方法。" * 80,
+                    media_type=MediaType.ARTICLE,
+                    published_at=None,
+                    metrics=EngagementMetrics(),
+                    url="https://mp.weixin.qq.com/s/unknown",
+                    source_api="wechat-download-api",
+                    raw_payload={},
+                ),
+            ],
+            "hotness_scores": [
+                HotnessScore(
+                    content_id="known-reads",
+                    hotness_score=40.0,
+                    velocity_score=0.0,
+                    engagement_quality_score=0.0,
+                    platform_weight=1.0,
+                    reason="有阅读量",
+                ),
+                HotnessScore(
+                    content_id="unknown-reads",
+                    hotness_score=90.0,
+                    velocity_score=0.0,
+                    engagement_quality_score=0.0,
+                    platform_weight=1.0,
+                    reason="无阅读量但 AI 热度高",
+                ),
+            ],
+        }
+
+        candidates = _wechat_10w_hot_candidates(state, limit=2)
+
+        self.assertEqual(candidates[0]["content_id"], "known-reads")
+        self.assertEqual(candidates[0]["source"], "wechat-10w-hot")
+        self.assertIn("阅读量 12000", candidates[0]["hot_reason"])
+        self.assertIn("未返回阅读量", candidates[1]["hot_reason"])
 
     def test_rewrite_selected_article_uses_selected_content(self) -> None:
         state = {
@@ -238,6 +422,29 @@ class ServerTest(unittest.TestCase):
         self.assertFalse(source["human_review_required"])
         self.assertEqual(source["review_flags"], [])
 
+    def test_enrich_content_detail_reports_short_fetch_failure(self) -> None:
+        content = NormalizedContent(
+            platform=Platform.WECHAT,
+            content_id="content-1",
+            author="AI 公众号",
+            title="短正文文章",
+            text="只有十二字",
+            media_type=MediaType.ARTICLE,
+            published_at=None,
+            metrics=EngagementMetrics(),
+            url="https://mp.weixin.qq.com/s/demo",
+            source_api="wechat-download-api",
+            raw_payload={},
+        )
+
+        with patch("app.server.WechatDownloadApiClient.from_env", return_value=None):
+            enriched, status = _enrich_content_detail_with_status(content)
+
+        self.assertEqual(enriched.text, "只有十二字")
+        self.assertEqual(status["status"], "missing_client")
+        self.assertEqual(status["final_text_length"], 5)
+        self.assertIn("未配置", status["message"])
+
     def test_rewrite_workspace_contains_flow_ui(self) -> None:
         html = _rewrite_workspace_html()
 
@@ -254,6 +461,12 @@ class ServerTest(unittest.TestCase):
         self.assertIn("/workflow/rewrite/selected/stream", html)
         self.assertIn("/workflow/rewrite/subscriptions/refresh/stream", html)
         self.assertIn("手动更新订阅号文章", html)
+        self.assertIn("wechat-10w-hot 高热榜", html)
+        self.assertIn("/workflow/rewrite/hot-candidates", html)
+        self.assertIn("loadHotCandidates", html)
+        self.assertIn("currentCandidateMode", html)
+        self.assertIn("hot_badge", html)
+        self.assertIn("hot_reason", html)
         self.assertIn("manualRefreshSubscriptions", html)
         self.assertIn("refresh-progress", html)
         self.assertIn("activeRefreshTimerId", html)
@@ -273,7 +486,14 @@ class ServerTest(unittest.TestCase):
         self.assertIn("已耗时", html)
         self.assertIn("candidatesById", html)
         self.assertIn("localStorage", html)
-        self.assertIn("langgraph-study:rewrite:candidates:v3", html)
+        self.assertIn("AI 知识型高热公众号文章", html)
+        self.assertIn("图文 OCR 证据增强", html)
+        self.assertIn("状态/图片", html)
+        self.assertIn("formatSignals", html)
+        self.assertIn("formatMetric", html)
+        self.assertIn("未知", html)
+        self.assertIn("image-ocr", html)
+        self.assertIn("langgraph-study:rewrite:candidates:v4", html)
         self.assertIn("activeRewriteRequestId", html)
         self.assertIn("当前改写来源", html)
         self.assertIn("cache_only=${refresh ? \"false\" : \"true\"}", html)
@@ -306,15 +526,27 @@ class ServerTest(unittest.TestCase):
     def test_delete_previous_wechat_download_cache_keeps_today_cache(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             cache_dir = Path(temp_dir) / "wechat_article_lists"
+            detail_cache_dir = Path(temp_dir) / "wechat_article_details"
             cache_dir.mkdir()
+            detail_cache_dir.mkdir()
             yesterday_cache = cache_dir / "old.json"
             today_cache = cache_dir / "today.json"
+            yesterday_detail_cache = detail_cache_dir / "old-detail.json"
+            today_detail_cache = detail_cache_dir / "today-detail.json"
             workflow_cache = Path(temp_dir) / "workflow_rewrite_state.json"
             yesterday_cache.write_text(
                 json.dumps({"cached_at": "2026-07-07T10:00:00+00:00", "payload": {}}),
                 encoding="utf-8",
             )
             today_cache.write_text(
+                json.dumps({"cached_at": "2026-07-08T01:00:00+00:00", "payload": {}}),
+                encoding="utf-8",
+            )
+            yesterday_detail_cache.write_text(
+                json.dumps({"cached_at": "2026-07-07T10:00:00+00:00", "payload": {}}),
+                encoding="utf-8",
+            )
+            today_detail_cache.write_text(
                 json.dumps({"cached_at": "2026-07-08T01:00:00+00:00", "payload": {}}),
                 encoding="utf-8",
             )
@@ -325,6 +557,7 @@ class ServerTest(unittest.TestCase):
 
             with (
                 patch("app.server.ARTICLE_LIST_CACHE_DIR", cache_dir),
+                patch("app.server.ARTICLE_DETAIL_CACHE_DIR", detail_cache_dir),
                 patch("app.server.WORKFLOW_CACHE_FILE", workflow_cache),
             ):
                 result = _delete_previous_wechat_download_cache(
@@ -332,9 +565,12 @@ class ServerTest(unittest.TestCase):
                 )
 
             self.assertEqual(result["article_list_cache_deleted"], 1)
+            self.assertEqual(result["article_detail_cache_deleted"], 1)
             self.assertEqual(result["workflow_cache_deleted"], 1)
             self.assertFalse(yesterday_cache.exists())
             self.assertTrue(today_cache.exists())
+            self.assertFalse(yesterday_detail_cache.exists())
+            self.assertTrue(today_detail_cache.exists())
             self.assertFalse(workflow_cache.exists())
 
     def test_video_workspace_redirects_to_agent(self) -> None:

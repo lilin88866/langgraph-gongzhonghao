@@ -18,6 +18,7 @@ from app.schemas.hotspot import ApiDimension, Platform, RawContent, SourcePlan
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
 ARTICLE_LIST_CACHE_DIR = ROOT_DIR / ".cache" / "wechat_article_lists"
+ARTICLE_DETAIL_CACHE_DIR = ROOT_DIR / ".cache" / "wechat_article_details"
 DEFAULT_EXCLUDED_ACCOUNT_KEYWORDS = [
     "Promotion",
     "推广",
@@ -39,6 +40,7 @@ DEFAULT_EXCLUDED_ACCOUNT_KEYWORDS = [
     "私域",
     "引流",
     "视频号运营",
+    "红狐",
 ]
 DEFAULT_EXCLUDED_ARTICLE_TITLE_KEYWORDS = [
     "训练营",
@@ -69,6 +71,7 @@ DEFAULT_EXCLUDED_ARTICLE_TITLE_KEYWORDS = [
     "招商",
     "项目",
     "视频号运营",
+    "红狐",
 ]
 
 
@@ -262,15 +265,39 @@ class WechatDownloadApiClient:
         url = str(plan.metadata.get("url") or plan.query or "")
         if not url.startswith("http"):
             return []
-        payload = self._post_json(
-            "/api/article",
-            {"url": url},
-            timeout_seconds=float(os.getenv("WECHAT_ARTICLE_DETAIL_TIMEOUT_SECONDS", "90")),
-        )
+        payload = self._get_cached_article_detail(url)
         detail = self._extract_detail(payload)
         if detail is not None:
             return [self._raw(plan, self._normalize_article_item(detail, plan))]
         return []
+
+    def _get_cached_article_detail(self, url: str) -> Any:
+        cache_path = _article_detail_cache_path(url)
+        if os.getenv("WECHAT_ARTICLE_DETAIL_CACHE", "1").lower() not in {"0", "false", "no"}:
+            cached = _read_article_list_cache(cache_path, allow_stale=False)
+            if cached is not None:
+                return cached
+
+        timeout_seconds = float(os.getenv("WECHAT_ARTICLE_DETAIL_TIMEOUT_SECONDS", "45"))
+        attempts = max(1, int(os.getenv("WECHAT_ARTICLE_DETAIL_ATTEMPTS", "2")))
+        last_error: RuntimeError | None = None
+        for attempt in range(attempts):
+            try:
+                payload = self._post_json("/api/article", {"url": url}, timeout_seconds=timeout_seconds)
+                if os.getenv("WECHAT_ARTICLE_DETAIL_CACHE", "1").lower() not in {"0", "false", "no"}:
+                    _write_article_list_cache(cache_path, payload)
+                return payload
+            except RuntimeError as exc:
+                last_error = exc
+                if attempt + 1 < attempts:
+                    continue
+
+        stale = _read_article_list_cache(cache_path, allow_stale=True)
+        if stale is not None:
+            return stale
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError("wechat-download-api article detail returned no payload")
 
     def _get_article_list(self, plan: SourcePlan, fakeid: str) -> Any:
         return self._get_json(
@@ -452,9 +479,36 @@ class WechatDownloadApiClient:
             "published_at": _pick_str(article, "publish_time", "update_time", "time", "datetime", "create_time"),
             "url": url,
             "metrics": {
-                "reads": _pick_int(article, "readnum", "read_count", "readNum", "read_count_num"),
-                "likes": _pick_int(article, "likenum", "like_count", "likeNum", "like_count_num"),
-                "comments": _pick_int(article, "comment_count", "commentNum"),
+                "reads": _article_metric(
+                    article,
+                    item,
+                    "readnum",
+                    "read_num",
+                    "read_count",
+                    "readCount",
+                    "readNum",
+                    "read_count_num",
+                    "readNumStr",
+                    "read_num_str",
+                ),
+                "likes": _article_metric(
+                    article,
+                    item,
+                    "likenum",
+                    "like_num",
+                    "like_count",
+                    "likeCount",
+                    "likeNum",
+                    "like_count_num",
+                ),
+                "comments": _article_metric(
+                    article,
+                    item,
+                    "comment_count",
+                    "comment_num",
+                    "commentCount",
+                    "commentNum",
+                ),
             },
             "account": {
                 "fakeid": account_fakeid,
@@ -480,6 +534,11 @@ def _split_csv(value: str) -> list[str]:
 def _article_list_cache_path(fakeid: str, page_size: int) -> Path:
     key = sha1(f"{fakeid}|{page_size}".encode("utf-8")).hexdigest()[:16]
     return ARTICLE_LIST_CACHE_DIR / f"{key}.json"
+
+
+def _article_detail_cache_path(url: str) -> Path:
+    key = sha1(url.encode("utf-8")).hexdigest()[:16]
+    return ARTICLE_DETAIL_CACHE_DIR / f"{key}.json"
 
 
 def _read_article_list_cache(path: Path, *, allow_stale: bool) -> Any | None:
@@ -597,11 +656,53 @@ def _pick_int(item: dict[str, Any], *keys: str) -> int | None:
         value = item.get(key)
         if value is None or value == "":
             continue
-        try:
-            return int(value)
-        except (TypeError, ValueError):
-            continue
+        parsed = _coerce_metric_int(value)
+        if parsed is not None:
+            return parsed
     return None
+
+
+def _article_metric(article: dict[str, Any], item: dict[str, Any], *keys: str) -> int | None:
+    candidates = [article, item]
+    for container_key in ("appmsgstat", "stat", "stats", "metrics", "app_msg_stat", "appmsg_stat"):
+        nested = article.get(container_key)
+        if isinstance(nested, dict):
+            candidates.append(nested)
+        nested = item.get(container_key)
+        if isinstance(nested, dict):
+            candidates.append(nested)
+    for candidate in candidates:
+        value = _pick_int(candidate, *keys)
+        if value is not None:
+            return value
+    return None
+
+
+def _coerce_metric_int(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return int(value)
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip().replace(",", "").replace("，", "")
+    if not normalized:
+        return None
+    plus_100k = "10万+" in normalized or "100000+" in normalized.lower()
+    if plus_100k:
+        return 100000
+    multiplier = 1
+    if "万" in normalized:
+        multiplier = 10000
+    elif normalized.lower().endswith("k"):
+        multiplier = 1000
+    match = re.search(r"\d+(?:\.\d+)?", normalized)
+    if not match:
+        return None
+    try:
+        return int(float(match.group(0)) * multiplier)
+    except ValueError:
+        return None
 
 
 def _html_to_text(value: str) -> str:

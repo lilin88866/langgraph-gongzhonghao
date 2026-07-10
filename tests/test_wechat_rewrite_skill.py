@@ -48,6 +48,7 @@ class WechatRewriteSkillTest(unittest.TestCase):
                 "author": "爱AI的大刘",
                 "url": "https://mp.weixin.qq.com/s/demo",
                 "metrics": {"reads": 12000, "likes": 300, "hotness_score": 91.0},
+                "source_outline": "原文段落骨架（必须按顺序覆盖）：\n1. 提示词背景\n   - 先讲 CLAUDE.md 的使用场景。",
             }
         )
 
@@ -63,16 +64,24 @@ class WechatRewriteSkillTest(unittest.TestCase):
         self.assertIn("### 来源与复核提醒", prompt)
         self.assertIn("### 配图建议", prompt)
         self.assertIn("### 发布风险自查", prompt)
-        self.assertIn("保留原文的版式骨架", prompt)
-        self.assertIn("相似度目标区间是 25%-30%", prompt)
+        self.assertIn("确定性原文骨架", prompt)
+        self.assertIn("必须先沿“确定性原文骨架”逐段润色", prompt)
+        self.assertIn("正文里禁止出现任何内部实现标签、系统说明或失败兜底说明", prompt)
+        self.assertIn("先讲 CLAUDE.md 的使用场景", prompt)
+        self.assertIn("相似度目标区间是 25%-35%", prompt)
         self.assertIn("AI 知识型/讲解型订阅号", prompt)
-        self.assertIn("是什么、为什么重要、普通人怎么理解", prompt)
+        self.assertIn("LLM 只负责表达润色", prompt)
         self.assertIn("配图占位卡片", prompt)
         self.assertIn("不要只在文末列配图建议", prompt)
         self.assertIn("按正文长度估算插入 1 个", prompt)
         self.assertIn("只汇总正文中已经插入的配图占位卡片", prompt)
         self.assertIn("正文配图复核", prompt)
-        self.assertIn("模型迁移工作流", prompt)
+        self.assertIn("禁止照抄", prompt)
+        self.assertIn("根据原文当前段落生成的具体主题", prompt)
+        self.assertIn("参考原图", prompt)
+        self.assertIn("对应原文图片编号/URL", prompt)
+        self.assertNotIn("模型迁移工作流", prompt)
+        self.assertNotIn("长期评估 -> 灰度上线 -> Prompt 调优 -> 全面切换", prompt)
 
     def test_build_task_prompt_uses_source_image_count(self) -> None:
         skill = WechatRewriteSkill(
@@ -135,6 +144,9 @@ class WechatRewriteSkillTest(unittest.TestCase):
 
         self.assertIn("原文检测到 2 张配图", prompt)
         self.assertIn("必须对应插入 2 个“配图占位卡片”", prompt)
+        self.assertIn("原文图片 1：https://mmbiz.qpic.cn/one", prompt)
+        self.assertIn("原文图片 2：https://mmbiz.qpic.cn/two", prompt)
+        self.assertIn("参考原图：原文图片 N / URL", prompt)
 
     def test_default_loads_project_local_supporting_skills(self) -> None:
         with patch.dict(os.environ, {}, clear=True):

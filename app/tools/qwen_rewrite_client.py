@@ -79,6 +79,9 @@ class QwenRewriteClient:
                 {"role": "user", "content": prompt},
             ],
         }
+        max_tokens = os.getenv("QWEN_REWRITE_MAX_TOKENS")
+        if max_tokens:
+            payload["max_tokens"] = int(max_tokens)
         request = Request(
             urljoin(self.base_url, "chat/completions"),
             data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),

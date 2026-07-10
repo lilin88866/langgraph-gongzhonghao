@@ -807,12 +807,15 @@ def _stream_rewrite_selected(payload: dict[str, Any]):
             }
 
             rewrite_started_at = time.monotonic()
+            rewrite_stage_events: Queue[dict[str, Any]] = Queue()
+            rewrite_state["progress_callback"] = rewrite_stage_events.put
             yield emit("progress", message=f"正在调用 wechat-rewrite Agent 改写《{content.title}》...")
             rewrite_update = yield from _run_with_stream_progress(
                 lambda: WechatArticleWritingAgent().invoke(rewrite_state),
                 emit=emit,
                 waiting_message=lambda elapsed: f"正在改写《{content.title}》，已耗时 {elapsed}。",
                 progress_phase="rewriting",
+                progress_events=rewrite_stage_events,
             )
             rewrite_elapsed = time.monotonic() - rewrite_started_at
             article = rewrite_update.get("generated_article")
@@ -883,6 +886,7 @@ def _run_with_stream_progress(
     emit: Callable[..., str],
     waiting_message: Callable[[str], str],
     progress_phase: str | None = None,
+    progress_events: Queue[dict[str, Any]] | None = None,
 ) -> Any:
     result_queue: Queue[tuple[str, Any]] = Queue()
 
@@ -895,6 +899,22 @@ def _run_with_stream_progress(
     started_at = time.monotonic()
     threading.Thread(target=run, daemon=True).start()
     while True:
+        if progress_events is not None:
+            while True:
+                try:
+                    event = progress_events.get_nowait()
+                except Empty:
+                    break
+                elapsed_seconds = time.monotonic() - started_at
+                payload = {
+                    "message": str(event.get("message") or waiting_message(_format_elapsed(elapsed_seconds))),
+                    "elapsed_seconds": round(elapsed_seconds, 3),
+                }
+                if event.get("phase"):
+                    payload["phase"] = str(event["phase"])
+                elif progress_phase:
+                    payload["phase"] = progress_phase
+                yield emit("progress", **payload)
         try:
             status, value = result_queue.get(timeout=1.0)
             break
@@ -905,6 +925,22 @@ def _run_with_stream_progress(
                 "elapsed_seconds": round(elapsed_seconds, 3),
             }
             if progress_phase:
+                payload["phase"] = progress_phase
+            yield emit("progress", **payload)
+    if progress_events is not None:
+        while True:
+            try:
+                event = progress_events.get_nowait()
+            except Empty:
+                break
+            elapsed_seconds = time.monotonic() - started_at
+            payload = {
+                "message": str(event.get("message") or waiting_message(_format_elapsed(elapsed_seconds))),
+                "elapsed_seconds": round(elapsed_seconds, 3),
+            }
+            if event.get("phase"):
+                payload["phase"] = str(event["phase"])
+            elif progress_phase:
                 payload["phase"] = progress_phase
             yield emit("progress", **payload)
     if status == "error":
@@ -4531,6 +4567,8 @@ def _rewrite_workspace_html() -> str:
     let activeRefreshTimerId = null;
     let activeRefreshTimerStartMs = 0;
     let activeRefreshTimerItem = null;
+    let activeCandidateLoadTimerId = null;
+    let activeCandidateLoadTimerStartMs = 0;
     let activeRewriteTimerId = null;
     let activeRewriteTimerStartMs = 0;
     let activeRewriteTimerItem = null;
@@ -4539,29 +4577,37 @@ def _rewrite_workspace_html() -> str:
 
     async function loadCandidates(refresh = false) {
       const showedLocalCache = !refresh && renderCachedCandidates();
-      if (showedLocalCache) {
-        setStatus("已先显示本地缓存候选文章，正在后台检查更新...");
-      } else {
-        setStatus(refresh ? "正在重新拉取候选文章..." : "正在加载候选文章...");
-      }
-      const data = await fetchJson(`/workflow/rewrite/candidates?refresh=${refresh ? "true" : "false"}&cache_only=${refresh ? "false" : "true"}`);
-      const items = data.items || [];
-      if (!refresh && !data.cached && items.length === 0) {
+      try {
         if (showedLocalCache) {
-          setStatus("服务端暂无可用缓存，已继续显示浏览器本地缓存。点击“重新拉取”可更新公众号文章。");
+          startCandidateLoadElapsedStatus("已先显示本地缓存候选文章，正在后台检查更新");
+        } else {
+          startCandidateLoadElapsedStatus(refresh ? "正在重新拉取候选文章" : "正在加载候选文章");
+        }
+        const data = await fetchJson(`/workflow/rewrite/candidates?refresh=${refresh ? "true" : "false"}&cache_only=${refresh ? "false" : "true"}`);
+        const items = data.items || [];
+        if (!refresh && !data.cached && items.length === 0) {
+          stopCandidateLoadElapsedStatus();
+          if (showedLocalCache) {
+            setStatus("服务端暂无可用缓存，已继续显示浏览器本地缓存。点击“重新拉取”可更新公众号文章。");
+            return;
+          }
+          setStatus("暂无服务端缓存。请点击“重新拉取”获取公众号文章。");
           return;
         }
-        setStatus("暂无服务端缓存。请点击“重新拉取”获取公众号文章。");
-        return;
-      }
-      currentCandidateMode = "candidates";
-      renderCandidates(items);
-      if (items.length > 0) {
-        cacheCandidates(data);
-      }
-      setStatus(`已加载 ${items.length} 篇候选文章。${refresh ? "本次已重新拉取。" : ""}`);
-      if (!refresh && autoBackgroundRefresh) {
-        refreshCandidatesInBackground();
+        currentCandidateMode = "candidates";
+        renderCandidates(items);
+        if (items.length > 0) {
+          cacheCandidates(data);
+        }
+        const elapsedText = formatSeconds((Date.now() - activeCandidateLoadTimerStartMs) / 1000);
+        stopCandidateLoadElapsedStatus();
+        setStatus(`已加载 ${items.length} 篇候选文章。${refresh ? "本次已重新拉取。" : ""}用时 ${elapsedText}。`);
+        if (!refresh && autoBackgroundRefresh) {
+          refreshCandidatesInBackground();
+        }
+      } catch (error) {
+        stopCandidateLoadElapsedStatus();
+        throw error;
       }
     }
 
@@ -4730,6 +4776,24 @@ def _rewrite_workspace_html() -> str:
       }
       activeRefreshTimerItem = null;
       activeRefreshTimerStartMs = 0;
+    }
+
+    function startCandidateLoadElapsedStatus(prefix) {
+      stopCandidateLoadElapsedStatus();
+      activeCandidateLoadTimerStartMs = Date.now();
+      const render = () => {
+        const elapsed = (Date.now() - activeCandidateLoadTimerStartMs) / 1000;
+        setStatus(`${prefix}，已耗时 ${formatSeconds(elapsed)}。`);
+      };
+      render();
+      activeCandidateLoadTimerId = window.setInterval(render, 500);
+    }
+
+    function stopCandidateLoadElapsedStatus() {
+      if (activeCandidateLoadTimerId) {
+        window.clearInterval(activeCandidateLoadTimerId);
+        activeCandidateLoadTimerId = null;
+      }
     }
 
     async function fetchJson(url, options = {}) {

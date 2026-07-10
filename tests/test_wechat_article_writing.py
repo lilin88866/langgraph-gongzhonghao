@@ -30,6 +30,7 @@ class WechatArticleWritingAgentTest(unittest.TestCase):
         self.env_patcher.stop()
 
     def test_agent_generates_article_from_selected_trend_evidence(self) -> None:
+        progress_events: list[dict[str, str]] = []
         state = {
             "normalized_contents": [
                 NormalizedContent(
@@ -78,6 +79,7 @@ class WechatArticleWritingAgentTest(unittest.TestCase):
                     reason="测试",
                 )
             ],
+            "progress_callback": progress_events.append,
         }
 
         update = WechatArticleWritingAgent().invoke(state)
@@ -108,9 +110,15 @@ class WechatArticleWritingAgentTest(unittest.TestCase):
         self.assertIn("核心结构图", article.body_markdown)
         self.assertIn("实践路径图", article.body_markdown)
         self.assertIn("智能体正在把资料整理和内容生成串成稳定流程。", article.rewrite_prompt)
+        self.assertIn("确定性原文骨架", article.rewrite_prompt)
         self.assertNotIn("<em", article.body_markdown)
         self.assertIn("用户需要稳定的自动化流程。", article.body_markdown)
         self.assertEqual(article.source_content_ids, ["content-1"])
+        phases = [event["phase"] for event in progress_events]
+        self.assertIn("rewrite-outline", phases)
+        self.assertIn("rewrite-draft", phases)
+        self.assertIn("rewrite-length-check", phases)
+        self.assertIn("rewrite-similarity-check", phases)
 
     def test_agent_ranks_article_evidence_by_hotness_votes(self) -> None:
         state = {
@@ -280,13 +288,161 @@ class WechatArticleWritingAgentTest(unittest.TestCase):
         article = WechatArticleWritingAgent().invoke(state)["generated_article"]
 
         self.assertIn("原文正文长度约", article.rewrite_prompt)
-        self.assertIn("不得少于", article.rewrite_prompt)
-        self.assertIn("约为原文 70%", article.rewrite_prompt)
+        self.assertIn("应控制在", article.rewrite_prompt)
+        self.assertIn("约为原文 50%-90%", article.rewrite_prompt)
+        self.assertIn("禁止超过原文长度", article.rewrite_prompt)
         self.assertIn("原文关键信息展开", article.body_markdown)
         self.assertIn("原文要点 1", article.body_markdown)
         self.assertIn("第1段", article.body_markdown)
         self.assertIn("配图建议：Agent 范式长文解析核心结构图", article.body_markdown)
         self.assertIn("配图建议：Agent 范式长文解析实践路径图", article.body_markdown)
+
+    def test_agent_adds_missing_outline_blocks_when_llm_rewrite_is_too_short(self) -> None:
+        long_text = "Agent 工程实践需要解释目标、流程、工具配置、上下文管理、复核方式和风险边界。" * 120
+        state = {
+            "normalized_contents": [
+                NormalizedContent(
+                    platform=Platform.WECHAT,
+                    content_id="long",
+                    author="AI 知识号",
+                    title="Agent 长文实践",
+                    text=long_text,
+                    media_type=MediaType.ARTICLE,
+                    published_at=None,
+                    metrics=EngagementMetrics(reads=1000),
+                    url="https://mp.weixin.qq.com/s/long",
+                    source_api="wechat-download-api",
+                    raw_payload={},
+                )
+            ],
+            "trends": [
+                TrendCluster(
+                    trend_id="selected-long",
+                    name="Agent 长文实践",
+                    summary="测试趋势",
+                    content_ids=["long"],
+                    platforms=[Platform.WECHAT],
+                    hotness_score=80.0,
+                    lifecycle="rising",
+                    evidence=["long"],
+                )
+            ],
+        }
+
+        with patch(
+            "app.agents.wechat_article_writing._execute_rewrite_prompt",
+            return_value=("### 公众号改写正文\n\n<section><p>短稿。</p></section>\n\n### 来源与复核提醒\n\n1. 待复核", {"provider": "fallback", "total_tokens": 100}),
+        ) as execute:
+            article = WechatArticleWritingAgent().invoke(state)["generated_article"]
+
+        self.assertEqual(execute.call_count, 1)
+        self.assertIn("先看这篇文章在讲什么", article.body_markdown)
+        self.assertIn("Agent 工程实践要讲清目标", article.body_markdown)
+        self.assertNotIn("原文段落 1", article.body_markdown)
+        self.assertNotIn("信息块", article.body_markdown)
+        self.assertNotIn("原文核对信息", article.body_markdown)
+        assert article.llm_usage is not None
+        self.assertTrue(article.llm_usage["length_retry"]["accepted"])
+        self.assertTrue(article.llm_usage["length_retry"]["deterministic_supplement"])
+        self.assertGreaterEqual(article.llm_usage["similarity_retry"]["similarity"], 25)
+        self.assertLessEqual(article.llm_usage["similarity_retry"]["similarity"], 35)
+
+    def test_agent_switches_to_source_outline_when_llm_rewrite_is_too_different(self) -> None:
+        source_text = "Claude Loops 的核心是先写清目标，再让模型执行、检查、修正，并通过低 Token 的上下文管理降低成本。"
+        state = {
+            "normalized_contents": [
+                NormalizedContent(
+                    platform=Platform.WECHAT,
+                    content_id="loops",
+                    author="AI 知识号",
+                    title="如何写高质量、低Token消耗的Loops",
+                    text=source_text,
+                    media_type=MediaType.ARTICLE,
+                    published_at=None,
+                    metrics=EngagementMetrics(reads=1000),
+                    url="https://mp.weixin.qq.com/s/loops",
+                    source_api="wechat-download-api",
+                    raw_payload={},
+                )
+            ],
+            "trends": [
+                TrendCluster(
+                    trend_id="selected-loops",
+                    name="Claude Loops",
+                    summary="测试趋势",
+                    content_ids=["loops"],
+                    platforms=[Platform.WECHAT],
+                    hotness_score=80.0,
+                    lifecycle="rising",
+                    evidence=["loops"],
+                )
+            ],
+        }
+
+        with patch(
+            "app.agents.wechat_article_writing._execute_rewrite_prompt",
+            return_value=("### 公众号改写正文\n\n<section><p>今天聊一个完全不同的 AI 产品商业化故事。</p></section>", {"provider": "fallback", "total_tokens": 100}),
+        ) as execute:
+            article = WechatArticleWritingAgent().invoke(state)["generated_article"]
+
+        self.assertEqual(execute.call_count, 1)
+        self.assertIn("Claude Loops 的核心", article.body_markdown)
+        assert article.llm_usage is not None
+        self.assertFalse(article.llm_usage["similarity_retry"]["accepted"])
+        self.assertTrue(article.llm_usage["similarity_retry"]["deterministic_fallback"])
+        self.assertTrue(article.llm_usage["similarity_retry"]["forced_source_preserving_fallback"])
+        self.assertGreaterEqual(article.llm_usage["similarity_retry"]["similarity"], 25)
+
+    def test_agent_uses_source_preserving_fallback_when_similarity_repair_fails(self) -> None:
+        source_text = "Claude Loops 的核心是先写清目标，再让模型执行、检查、修正，并通过低 Token 的上下文管理降低成本。" * 12
+        state = {
+            "normalized_contents": [
+                NormalizedContent(
+                    platform=Platform.WECHAT,
+                    content_id="loops",
+                    author="AI 知识号",
+                    title="如何写高质量、低Token消耗的Loops",
+                    text=source_text,
+                    media_type=MediaType.ARTICLE,
+                    published_at=None,
+                    metrics=EngagementMetrics(reads=1000),
+                    url="https://mp.weixin.qq.com/s/loops",
+                    source_api="wechat-download-api",
+                    raw_payload={},
+                )
+            ],
+            "trends": [
+                TrendCluster(
+                    trend_id="selected-loops",
+                    name="Claude Loops",
+                    summary="测试趋势",
+                    content_ids=["loops"],
+                    platforms=[Platform.WECHAT],
+                    hotness_score=80.0,
+                    lifecycle="rising",
+                    evidence=["loops"],
+                )
+            ],
+        }
+
+        with patch(
+            "app.agents.wechat_article_writing._execute_rewrite_prompt",
+            return_value=("### 公众号改写正文\n\n<section><p>这是一篇完全不同的创业故事。</p></section>", {"provider": "fallback", "total_tokens": 100}),
+        ) as execute:
+            article = WechatArticleWritingAgent().invoke(state)["generated_article"]
+
+        self.assertEqual(execute.call_count, 1)
+        self.assertIn("先看这篇文章在讲什么", article.body_markdown)
+        self.assertIn("关键做法：沿着原文逻辑拆开看", article.body_markdown)
+        self.assertIn("Claude Loops 的核心", article.body_markdown)
+        self.assertNotIn("上一次模型改写", article.body_markdown)
+        self.assertNotIn("信息块", article.body_markdown)
+        self.assertNotIn("原文核对信息", article.body_markdown)
+        self.assertNotIn("原文骨架", article.body_markdown)
+        self.assertNotIn("继续讲另一个产品增长故事", article.body_markdown)
+        assert article.llm_usage is not None
+        self.assertTrue(article.llm_usage["similarity_retry"]["forced_source_preserving_fallback"])
+        self.assertGreaterEqual(article.llm_usage["similarity_retry"]["similarity"], 25)
 
     def test_compliance_report_flags_high_similarity(self) -> None:
         source = NormalizedContent(
@@ -307,7 +463,7 @@ class WechatArticleWritingAgentTest(unittest.TestCase):
 
         self.assertIn("与原文相似度：", report)
         self.assertIn("合规判断：需人工复核", report)
-        self.assertIn("目标相似度为 25%-30%", report)
+        self.assertIn("目标相似度为 25%-35%", report)
 
     def test_execute_rewrite_prompt_falls_back_to_ollama_on_quota_error(self) -> None:
         primary = Mock()

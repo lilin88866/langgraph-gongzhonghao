@@ -57,6 +57,7 @@ def _review_flags_for(flags: list[str]) -> list[str]:
         "no_trend_detected",
         "duplicate_title:",
         "article_rewrite_too_short:",
+        "article_rewrite_too_long:",
         "missing_inline_image_suggestions",
     )
     info_prefixes = ("wechat_accounts_discovered:",)
@@ -72,7 +73,10 @@ def _article_review_flags(article_compliance: object) -> list[str]:
         return []
     if article_compliance.get("compliant") is False:
         similarity = article_compliance.get("similarity")
+        min_similarity = article_compliance.get("min_similarity")
         max_similarity = article_compliance.get("max_similarity") or article_compliance.get("threshold")
+        if isinstance(similarity, (int, float)) and isinstance(min_similarity, (int, float)) and similarity < min_similarity:
+            return [f"article_similarity_too_low:{similarity}%"]
         if isinstance(similarity, (int, float)) and isinstance(max_similarity, (int, float)) and similarity > max_similarity:
             return [f"article_similarity_too_high:{similarity}%"]
     return []
@@ -86,8 +90,10 @@ def _rewrite_length_flags(state: HotspotState) -> list[str]:
     if source_length <= 0 or rewrite_length <= 0:
         return []
     ratio = rewrite_length / source_length
-    if ratio < 0.6:
+    if ratio < 0.5:
         return [f"article_rewrite_too_short:{rewrite_length}/{source_length}:{ratio:.0%}"]
+    if ratio > 0.9:
+        return [f"article_rewrite_too_long:{rewrite_length}/{source_length}:{ratio:.0%}"]
     return []
 
 

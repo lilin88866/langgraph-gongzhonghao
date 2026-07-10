@@ -52,6 +52,41 @@ class QualityControlAgentTest(unittest.TestCase):
         self.assertTrue(any(flag.startswith("article_rewrite_too_short:") for flag in update["review_flags"]))
         self.assertTrue(update["human_review_required"])
 
+    def test_flags_rewrite_that_is_too_long_for_source(self) -> None:
+        source_text = "原文关键解释。" * 120
+        article = GeneratedArticle(
+            title="超长改写",
+            subtitle="测试",
+            body_markdown="### 公众号改写正文\n\n<section><p>配图建议：正文卡片。</p><p>" + ("扩写内容。" * 400) + "</p></section>",
+            source_trend_id="trend-1",
+            source_content_ids=["content-1"],
+            recommended_tags=[],
+        )
+        state = {
+            "normalized_contents": [
+                NormalizedContent(
+                    platform=Platform.WECHAT,
+                    content_id="content-1",
+                    author="AI 公众号",
+                    title="原文",
+                    text=source_text,
+                    media_type=MediaType.ARTICLE,
+                    published_at=None,
+                    metrics=EngagementMetrics(),
+                    url="https://mp.weixin.qq.com/s/source",
+                    source_api="wechat-download-api",
+                    raw_payload={},
+                )
+            ],
+            "generated_article": article,
+        }
+
+        update = QualityControlAgent().invoke(state)
+
+        self.assertTrue(any(flag.startswith("article_rewrite_too_long:") for flag in update["quality_flags"]))
+        self.assertTrue(any(flag.startswith("article_rewrite_too_long:") for flag in update["review_flags"]))
+        self.assertTrue(update["human_review_required"])
+
     def test_information_flags_do_not_require_human_review(self) -> None:
         update = QualityControlAgent().invoke(
             {
@@ -76,6 +111,18 @@ class QualityControlAgentTest(unittest.TestCase):
 
         self.assertIn("fetch_failed:wechat:work_list:captcha", update["review_flags"])
         self.assertIn("article_similarity_too_high:62%", update["review_flags"])
+        self.assertTrue(update["human_review_required"])
+
+    def test_article_similarity_too_low_requires_review(self) -> None:
+        update = QualityControlAgent().invoke(
+            {
+                "trends": [object()],
+                "quality_flags": [],
+                "article_compliance": {"similarity": 12, "min_similarity": 25, "max_similarity": 30, "compliant": False},
+            }
+        )
+
+        self.assertIn("article_similarity_too_low:12%", update["review_flags"])
         self.assertTrue(update["human_review_required"])
 
     def test_flags_missing_inline_image_suggestions(self) -> None:

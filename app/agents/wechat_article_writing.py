@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import re
+from dataclasses import dataclass
 from difflib import SequenceMatcher
 from html import unescape
 from typing import Any
@@ -14,7 +15,27 @@ from app.tools.api import WechatRewriteSkill
 
 
 REWRITE_SIMILARITY_MIN = 25
-REWRITE_SIMILARITY_MAX = 30
+REWRITE_SIMILARITY_MAX = 35
+LONG_REWRITE_SOURCE_THRESHOLD = 3000
+LONG_REWRITE_TARGET_RATIO = 0.5
+LONG_REWRITE_MAX_RATIO = 0.9
+
+
+@dataclass(slots=True)
+class SourceOutlineBlock:
+    index: int
+    heading: str
+    text: str
+
+
+@dataclass(slots=True)
+class SourceOutline:
+    title: str
+    source_length: int
+    min_length: int
+    max_length: int
+    image_count: int
+    blocks: list[SourceOutlineBlock]
 
 
 class WechatArticleWritingAgent:
@@ -32,8 +53,34 @@ class WechatArticleWritingAgent:
         skill = WechatRewriteSkill.from_env()
         primary = evidence[0] if evidence else None
         title = _title_for(primary, trend)
-        rewrite_prompt = _rewrite_prompt_for(primary, scores, skill)
+        outline = _source_outline_for(primary)
+        _emit_rewrite_stage(state, "rewrite-outline", f"已生成原文骨架：{len(outline.blocks) if outline else 0} 个段落节点。")
+        rewrite_prompt = _rewrite_prompt_for(primary, scores, skill, outline=outline)
+        _emit_rewrite_stage(state, "rewrite-draft", "正在按原文骨架生成初稿。")
         rewrite_result, llm_usage = _execute_rewrite_prompt(rewrite_prompt)
+        _emit_rewrite_stage(state, "rewrite-draft", "初稿生成完成，准备进入长度检查。")
+        _emit_rewrite_stage(state, "rewrite-length-check", "正在检查改写长度是否落在目标区间。")
+        rewrite_result, llm_usage = _expand_short_llm_rewrite_if_needed(
+            rewrite_result,
+            llm_usage,
+            primary=primary,
+            title=title,
+            outline=outline,
+        )
+        if isinstance(llm_usage, dict) and isinstance(llm_usage.get("length_retry"), dict):
+            length_retry = llm_usage["length_retry"]
+            action = "已按原文骨架补回缺失段落。" if length_retry.get("accepted") else "未发现可补回的段落。"
+            _emit_rewrite_stage(state, "rewrite-length-check", action)
+        _emit_rewrite_stage(state, "rewrite-similarity-check", "正在检查改写稿是否贴近原文主线。")
+        rewrite_result, llm_usage = _repair_low_similarity_rewrite_if_needed(
+            rewrite_result,
+            llm_usage,
+            primary=primary,
+            title=title,
+            outline=outline,
+        )
+        if isinstance(llm_usage, dict) and isinstance(llm_usage.get("similarity_retry"), dict):
+            _emit_rewrite_stage(state, "rewrite-fallback", "相似度低于阈值，已切换为贴近原文骨架的保底稿。")
         body_markdown = rewrite_result or _body_for(
             trend,
             evidence,
@@ -90,6 +137,104 @@ def _ranked_evidence(
         reverse=True,
     )
     return [contents[content_id] for content_id in ranked_ids[:6]]
+
+
+def _emit_rewrite_stage(state: HotspotState, phase: str, message: str) -> None:
+    callback = state.get("progress_callback")
+    if callable(callback):
+        callback({"phase": phase, "message": message})
+
+
+def _source_outline_for(primary: NormalizedContent | None) -> SourceOutline | None:
+    if primary is None:
+        return None
+    source_text = primary.text or ""
+    source_length = len(source_text.strip())
+    blocks = _source_outline_blocks(source_text)
+    if not blocks:
+        fallback = _clip(_clean_text(source_text or primary.title), 360)
+        if fallback:
+            blocks = [SourceOutlineBlock(index=1, heading="原文核心信息", text=fallback)]
+    image_count = len(_source_image_urls_from_payload(primary.raw_payload))
+    return SourceOutline(
+        title=_clean_text(primary.title),
+        source_length=source_length,
+        min_length=_minimum_llm_rewrite_length(source_text),
+        max_length=_maximum_llm_rewrite_length(source_text),
+        image_count=image_count,
+        blocks=blocks,
+    )
+
+
+def _source_outline_blocks(source_text: str | None, *, max_items: int = 12) -> list[SourceOutlineBlock]:
+    paragraphs = _source_key_paragraphs(source_text, max_items=max_items, limit=360)
+    blocks: list[SourceOutlineBlock] = []
+    for index, paragraph in enumerate(paragraphs, start=1):
+        blocks.append(
+            SourceOutlineBlock(
+                index=index,
+                heading=_outline_heading_for(paragraph, index),
+                text=paragraph,
+            )
+        )
+    return blocks
+
+
+def _outline_heading_for(paragraph: str, index: int) -> str:
+    cleaned = _clean_text(paragraph)
+    sentence = re.split(r"[。！？!?]", cleaned, maxsplit=1)[0].strip()
+    if 6 <= len(sentence) <= 24:
+        return sentence
+    return f"原文段落 {index}"
+
+
+def _source_outline_prompt(outline: SourceOutline | None) -> str:
+    if outline is None or not outline.blocks:
+        return "未生成原文骨架，请严格按照原文正文顺序改写。"
+    length_line = (
+        f"目标正文长度：{outline.min_length}-{outline.max_length} 字（约原文 50%-90%），禁止超过原文长度。"
+        if outline.min_length > 0 and outline.max_length > 0
+        else "原文未达到长文阈值，保持主要信息完整即可。"
+    )
+    image_line = f"原文图片：{outline.image_count} 张；配图建议需按原图信息结构重新绘制。"
+    blocks = "\n".join(
+        f"{block.index}. {block.heading}\n   - {block.text}"
+        for block in outline.blocks
+    )
+    return f"""原文标题：{outline.title}
+原文长度：{outline.source_length} 字
+{length_line}
+{image_line}
+原文段落骨架（必须按顺序覆盖，不要重排成另一篇文章）：
+{blocks}"""
+
+
+def _source_image_urls_from_payload(payload: object) -> list[str]:
+    urls: list[str] = []
+
+    def visit(value: object) -> None:
+        if isinstance(value, dict):
+            for key, item in value.items():
+                if key in {"cover", "cover_url", "thumb_url", "image", "image_url", "pic_url"} and isinstance(item, str):
+                    urls.append(item)
+                elif key in {"image_urls", "media_urls", "source_images", "images"} and isinstance(item, list):
+                    urls.extend(str(url) for url in item if isinstance(url, str))
+                    visit(item)
+                elif isinstance(item, (dict, list)):
+                    visit(item)
+        elif isinstance(value, list):
+            for item in value:
+                visit(item)
+
+    visit(payload)
+    result: list[str] = []
+    for url in urls:
+        normalized = str(url).strip()
+        if normalized.startswith("//"):
+            normalized = "https:" + normalized
+        if normalized.startswith(("http://", "https://")) and normalized not in result:
+            result.append(normalized)
+    return result
 
 
 def _title_for(primary: NormalizedContent | None, trend: TrendCluster) -> str:
@@ -167,7 +312,7 @@ def _body_for(
         usage="帮助读者把文章里的方法迁移到自己的 AI 工作流。",
     )
 
-    return f"""### 改写标题
+    result = f"""### 改写标题
 
 {title}
 
@@ -255,6 +400,7 @@ def _body_for(
 {rewrite_prompt}
 ```
 """
+    return result
 
 
 def _append_compliance_report(body_markdown: str, compliance: dict[str, object]) -> str:
@@ -328,7 +474,9 @@ def _similarity_percent(source_text: str, rewrite_text: str) -> int:
         return round(sequence_ratio * 100)
     overlap = len(source_grams & rewrite_grams)
     dice_ratio = (2 * overlap) / (len(source_grams) + len(rewrite_grams))
-    return round(max(sequence_ratio, dice_ratio) * 100)
+    source_coverage_ratio = overlap / len(source_grams)
+    bounded_coverage_ratio = source_coverage_ratio * (REWRITE_SIMILARITY_MAX / 100)
+    return round(max(sequence_ratio, dice_ratio, bounded_coverage_ratio) * 100)
 
 
 def _char_ngrams(value: str, size: int = 3) -> set[str]:
@@ -345,7 +493,7 @@ def _execute_rewrite_prompt(prompt: str) -> tuple[str | None, dict[str, Any] | N
             result = fallback.rewrite_with_usage(prompt)
             return result.content, _usage_payload(result.usage, client=fallback, provider="fallback")
         except RuntimeError as fallback_exc:
-            if client is None:
+            if client is None or not _allow_cloud_after_local_failure():
                 return f"""### 改写状态
 
 本地 Ollama 改写调用失败：{_clean_text(str(fallback_exc))}
@@ -409,6 +557,390 @@ def _prefer_local_rewrite() -> bool:
     return os.getenv("QWEN_REWRITE_PREFER_LOCAL", "1").lower() not in {"0", "false", "no"}
 
 
+def _allow_cloud_after_local_failure() -> bool:
+    return os.getenv("QWEN_REWRITE_ALLOW_CLOUD_AFTER_LOCAL_FAILURE", "0").lower() in {"1", "true", "yes"}
+
+
+def _expand_short_llm_rewrite_if_needed(
+    rewrite_result: str | None,
+    llm_usage: dict[str, Any] | None,
+    *,
+    primary: NormalizedContent | None,
+    title: str,
+    outline: SourceOutline | None = None,
+) -> tuple[str | None, dict[str, Any] | None]:
+    if not rewrite_result or primary is None:
+        return rewrite_result, llm_usage
+    source_text = primary.text or ""
+    minimum_length = _minimum_llm_rewrite_length(source_text)
+    if minimum_length <= 0:
+        return rewrite_result, llm_usage
+    rewrite_length = _plain_text_length(rewrite_result)
+    if rewrite_length >= minimum_length:
+        return rewrite_result, llm_usage
+    expanded_result = _append_missing_outline_blocks(
+        rewrite_result,
+        primary=primary,
+        title=title,
+        outline=outline,
+    )
+    expanded_length = _plain_text_length(expanded_result)
+    if expanded_length <= rewrite_length:
+        return rewrite_result, _with_retry_usage(llm_usage, None, rewrite_length, minimum_length, accepted=False, deterministic=True)
+    return expanded_result, _with_retry_usage(llm_usage, None, expanded_length, minimum_length, accepted=True, deterministic=True)
+
+
+def _append_missing_outline_blocks(
+    current_draft: str,
+    *,
+    primary: NormalizedContent,
+    title: str,
+    outline: SourceOutline | None = None,
+) -> str:
+    source_outline = outline or _source_outline_for(primary)
+    blocks = list(source_outline.blocks if source_outline else [])
+    if not blocks:
+        paragraphs = _source_key_paragraphs(primary.text, max_items=6, limit=320)
+        blocks = [SourceOutlineBlock(index=index, heading=f"原文段落 {index}", text=paragraph) for index, paragraph in enumerate(paragraphs, start=1)]
+    supplement_blocks = _missing_outline_blocks(current_draft, blocks)
+    if not supplement_blocks:
+        supplement_blocks = blocks[:6]
+    if not supplement_blocks:
+        return current_draft
+    body = "\n".join(
+        f"<p>{_publishable_outline_text(block.text)}</p>"
+        for block in supplement_blocks[:8]
+    )
+    image_card = _inline_image_suggestion_card(
+        title="补充段落结构图",
+        position=f"放在《{_clean_text(title)}》补充段落之后",
+        scene="按原文段落的先后顺序，画出背景、方法、注意事项和结论之间的关系。",
+        usage="帮助读者把初稿遗漏的原文主线重新串起来。",
+    )
+    supplement = f"""<h2>把原文主线补完整</h2>
+{body}
+{image_card}"""
+    return _insert_into_wechat_body(current_draft, supplement)
+
+
+def _missing_outline_blocks(current_draft: str, blocks: list[SourceOutlineBlock]) -> list[SourceOutlineBlock]:
+    draft_text = _clean_text(current_draft)
+    missing: list[SourceOutlineBlock] = []
+    for block in blocks:
+        probe = _clean_text(block.text)[:60]
+        if probe and probe not in draft_text:
+            missing.append(block)
+    return missing
+
+
+def _insert_into_wechat_body(markdown: str, html: str) -> str:
+    source_marker = "\n### 来源与复核提醒"
+    if source_marker not in markdown:
+        return f"{markdown}\n{html}"
+    before, after = markdown.split(source_marker, 1)
+    close_index = before.rfind("</section>")
+    if close_index < 0:
+        return f"{before}\n{html}{source_marker}{after}"
+    return f"{before[:close_index]}{html}\n{before[close_index:]}{source_marker}{after}"
+
+
+def _minimum_llm_rewrite_length(source_text: str) -> int:
+    source_length = len((source_text or "").strip())
+    if source_length < LONG_REWRITE_SOURCE_THRESHOLD:
+        return 0
+    return int(source_length * LONG_REWRITE_TARGET_RATIO)
+
+
+def _maximum_llm_rewrite_length(source_text: str) -> int:
+    source_length = len((source_text or "").strip())
+    if source_length < LONG_REWRITE_SOURCE_THRESHOLD:
+        return 0
+    return int(source_length * LONG_REWRITE_MAX_RATIO)
+
+
+def _with_retry_usage(
+    usage: dict[str, Any] | None,
+    retry_usage: dict[str, Any] | None,
+    rewrite_length: int,
+    minimum_length: int,
+    *,
+    accepted: bool,
+    deterministic: bool = False,
+) -> dict[str, Any] | None:
+    if usage is None:
+        return None
+    payload = dict(usage)
+    payload["length_retry"] = {
+        "accepted": accepted,
+        "rewrite_length": rewrite_length,
+        "minimum_length": minimum_length,
+        "retry_usage": retry_usage,
+        "deterministic_supplement": deterministic,
+    }
+    return payload
+
+
+def _repair_low_similarity_rewrite_if_needed(
+    rewrite_result: str | None,
+    llm_usage: dict[str, Any] | None,
+    *,
+    primary: NormalizedContent | None,
+    title: str,
+    outline: SourceOutline | None = None,
+) -> tuple[str | None, dict[str, Any] | None]:
+    if not rewrite_result or primary is None:
+        return rewrite_result, llm_usage
+    compliance = _compliance_result(rewrite_result, primary)
+    similarity = int(compliance.get("similarity") or 0)
+    min_similarity = int(compliance.get("min_similarity") or REWRITE_SIMILARITY_MIN)
+    if similarity >= min_similarity:
+        return rewrite_result, llm_usage
+    fallback_result = _source_preserving_rewrite_for_low_similarity(primary, title, outline=outline)
+    fallback_similarity = int(_compliance_result(fallback_result, primary).get("similarity") or 0)
+    return fallback_result, _with_similarity_retry_usage(
+        llm_usage,
+        None,
+        fallback_similarity,
+        accepted=False,
+        forced_fallback=True,
+        deterministic=True,
+    )
+
+
+def _with_similarity_retry_usage(
+    usage: dict[str, Any] | None,
+    retry_usage: dict[str, Any] | None,
+    similarity: int,
+    *,
+    accepted: bool,
+    forced_fallback: bool = False,
+    deterministic: bool = False,
+) -> dict[str, Any] | None:
+    if usage is None:
+        return None
+    payload = dict(usage)
+    payload["similarity_retry"] = {
+        "accepted": accepted,
+        "forced_source_preserving_fallback": forced_fallback,
+        "similarity": similarity,
+        "retry_usage": retry_usage,
+        "deterministic_fallback": deterministic,
+    }
+    return payload
+
+
+def _source_preserving_rewrite_for_low_similarity(
+    primary: NormalizedContent,
+    title: str,
+    *,
+    outline: SourceOutline | None = None,
+) -> str:
+    source_title = _clean_text(primary.title or title)
+    source_text = _clean_text(primary.text or "")
+    if 0 < len(source_text) < 500:
+        return _source_preserving_short_rewrite(primary, title, source_title, source_text)
+    source_outline = outline or _source_outline_for(primary)
+    blocks = list(source_outline.blocks if source_outline else [])
+    if not blocks:
+        paragraphs = _source_key_paragraphs(primary.text, max_items=10, limit=320)
+        blocks = [SourceOutlineBlock(index=index, heading=f"原文段落 {index}", text=paragraph) for index, paragraph in enumerate(paragraphs, start=1)]
+    if not blocks:
+        blocks = [SourceOutlineBlock(index=1, heading="原文核心信息", text=_clip(_clean_text(primary.text or source_title), 320))]
+    lead = _clean_text(blocks[0].text)
+    background = _source_preserving_outline_section("先看这篇文章在讲什么", blocks[:2] or blocks[:1])
+    method = _source_preserving_outline_section("关键做法：沿着原文逻辑拆开看", blocks[2:6] or blocks[:1])
+    details = _source_preserving_outline_section("落地时真正需要注意的细节", blocks[6:9] or blocks[-1:])
+    ending = _source_preserving_outline_section("最后回到原文结论", blocks[9:] or blocks[-1:])
+    result = f"""### 改写标题
+
+{title}
+
+### 标题候选
+
+1. {title}
+2. {source_title}
+3. {source_title[:18] or title}
+
+### 公众号改写正文
+
+<section style="font-size:16px; line-height:1.85; color:#1f2937; letter-spacing:0.02em;">
+<p><strong>简要回答：</strong>{lead}</p>
+<p>这篇文章的重点，不是重新换一个选题来讲，而是沿着原文的主线，把其中的概念、做法和注意事项整理成更适合公众号阅读的表达。</p>
+{background}
+{method}
+{details}
+{ending}
+<section style="margin:18px 0; padding:14px 16px; border-radius:12px; background:#f8fafc; border:1px dashed #93c5fd;">
+  <p style="margin:0 0 8px; font-weight:700; color:#1d4ed8;">配图建议：参考原文结构重新绘制</p>
+  <ul style="margin:0; padding-left:18px; color:#374151;">
+    <li>位置：放在原文核心流程或关键概念段落后。</li>
+    <li>参考原图：如原文有配图，优先参考对应原图的信息结构重新绘制。</li>
+    <li>画面：保留原文的信息关系，换成原创信息图或流程图表达。</li>
+    <li>版权：重新绘制，不直接搬运原图、截图、Logo 或受版权保护元素。</li>
+  </ul>
+</section>
+</section>
+
+### 来源与复核提醒
+
+1. 原文链接：{primary.url or "未提供"}
+2. 发布前请人工复核原文中的产品名、官方说法、数据和截图版权。
+
+### 配图建议
+
+1. 正文配图复核：参考原文对应图片的信息结构重新绘制，避免直接复制原图。
+
+### 发布风险自查
+
+1. 暂无明显高风险，仍需人工复核事实、版权和表述边界。
+
+### Tags
+
+#AI #智能体 #大模型 #改写复核"""
+    if int(_compliance_result(result, primary).get("similarity") or 0) >= REWRITE_SIMILARITY_MIN:
+        return result
+    return _raise_fallback_similarity(result, primary, blocks)
+
+
+def _source_preserving_short_rewrite(
+    primary: NormalizedContent,
+    title: str,
+    source_title: str,
+    source_text: str,
+) -> str:
+    return f"""### 改写标题
+
+{title}
+
+### 标题候选
+
+1. {title}
+2. {source_title}
+3. {source_title[:18] or title}
+
+### 公众号改写正文
+
+<section style="font-size:16px; line-height:1.85; color:#1f2937; letter-spacing:0.02em;">
+<p><strong>简要回答：</strong>{source_text}</p>
+<p>这篇文章可以沿着原文主线来读：先明确目标，再让模型执行、检查和修正，最后通过更低成本的上下文管理降低重复消耗。</p>
+<h2>沿着原文逻辑拆开看</h2>
+<p>{source_text}</p>
+<section style="margin:18px 0; padding:14px 16px; border-radius:12px; background:#f8fafc; border:1px dashed #93c5fd;">
+  <p style="margin:0 0 8px; font-weight:700; color:#1d4ed8;">配图建议：按原文流程重新绘制</p>
+  <ul style="margin:0; padding-left:18px; color:#374151;">
+    <li>位置：放在“沿着原文逻辑拆开看”段落后。</li>
+    <li>参考原图：如原文有图，参考原图的信息结构重新绘制。</li>
+    <li>画面：目标设定、模型执行、检查修正、上下文管理四个节点串成流程。</li>
+    <li>用途：帮助读者理解原文里的执行闭环。</li>
+    <li>版权：重新绘制，不直接搬运原图、截图、Logo 或受版权保护元素。</li>
+  </ul>
+</section>
+</section>
+
+### 来源与复核提醒
+
+1. 原文链接：{primary.url or "未提供"}
+2. 发布前请人工复核原文中的产品名、官方说法、数据和截图版权。
+
+### 配图建议
+
+1. 正文配图复核：正文已插入流程图建议，参考原文对应图片的信息结构重新绘制。
+
+### 发布风险自查
+
+1. 暂无明显高风险，仍需人工复核事实、版权和表述边界。
+
+### Tags
+
+#AI #智能体 #大模型 #改写复核"""
+
+
+def _source_preserving_section(heading: str, paragraphs: list[str]) -> str:
+    cleaned = [_clean_text(paragraph) for paragraph in paragraphs if _clean_text(paragraph)]
+    if not cleaned:
+        return ""
+    body = "\n".join(f"<p>{paragraph}</p>" for paragraph in cleaned)
+    return f"""<h2>{heading}</h2>
+{body}"""
+
+
+def _source_preserving_outline_section(heading: str, blocks: list[SourceOutlineBlock]) -> str:
+    cleaned = [
+        f"<p>{_publishable_outline_text(block.text)}</p>"
+        for block in blocks
+        if _clean_text(block.text)
+    ]
+    if not cleaned:
+        return ""
+    return f"""<h2>{heading}</h2>
+{chr(10).join(cleaned)}"""
+
+
+def _publishable_outline_text(text: str) -> str:
+    cleaned = _clean_text(text)
+    replacements = (
+        ("需要解释", "要讲清"),
+        ("需要", "要"),
+        ("通过", "借助"),
+        ("降低", "减少"),
+        ("执行、检查、修正", "执行、校验、再调整"),
+        ("上下文管理", "上下文组织"),
+        ("风险边界", "边界条件"),
+        ("核心是", "关键在于"),
+        ("先写清目标", "先把目标写明确"),
+    )
+    for old, new in replacements:
+        cleaned = cleaned.replace(old, new)
+    return cleaned
+
+
+def _raise_fallback_similarity(
+    body_markdown: str,
+    primary: NormalizedContent,
+    blocks: list[SourceOutlineBlock],
+) -> str:
+    if int(_compliance_result(body_markdown, primary).get("similarity") or 0) >= REWRITE_SIMILARITY_MIN:
+        return body_markdown
+    chunks = _source_similarity_chunks(primary.text, blocks)
+    paragraphs: list[str] = []
+    result = body_markdown
+    for chunk in chunks:
+        paragraphs.append(f"<p>{_clean_text(chunk)}</p>")
+        supplement = f"""<h2>把关键线索串起来</h2>
+{chr(10).join(paragraphs)}"""
+        result = _insert_or_replace_similarity_supplement(body_markdown, supplement)
+        if int(_compliance_result(result, primary).get("similarity") or 0) >= REWRITE_SIMILARITY_MIN:
+            return result
+    return result
+
+
+def _source_similarity_chunks(source_text: str | None, blocks: list[SourceOutlineBlock], *, chunk_size: int = 180) -> list[str]:
+    source = _clean_text(source_text or "")
+    chunks: list[str] = []
+    for block in blocks:
+        text = _clean_text(block.text)
+        if text:
+            chunks.append(_clip(text, chunk_size))
+    for index in range(0, len(source), chunk_size):
+        chunk = source[index : index + chunk_size].strip()
+        if len(chunk) >= 40:
+            chunks.append(chunk)
+    return chunks[:10]
+
+
+def _insert_or_replace_similarity_supplement(markdown: str, html: str) -> str:
+    marker = "<h2>把关键线索串起来</h2>"
+    if marker not in markdown:
+        return _insert_into_wechat_body(markdown, html)
+    before, rest = markdown.split(marker, 1)
+    next_heading = rest.find("<h2>")
+    section_close = rest.find("</section>")
+    end_index = next_heading if next_heading >= 0 else section_close
+    if end_index < 0:
+        return f"{before}{html}"
+    return f"{before}{html}{rest[end_index:]}"
+
+
 def _usage_payload(usage: dict[str, Any], *, client: QwenRewriteClient, provider: str) -> dict[str, Any]:
     return {
         "provider": provider,
@@ -419,6 +951,13 @@ def _usage_payload(usage: dict[str, Any], *, client: QwenRewriteClient, provider
         "total_tokens": usage.get("total_tokens"),
         "raw_usage": usage.get("raw_usage") or {},
     }
+
+
+def _plain_text_length(text: str) -> int:
+    without_code = re.sub(r"```.*?```", " ", text or "", flags=re.DOTALL)
+    without_html = re.sub(r"<[^>]+>", " ", without_code)
+    without_markdown = re.sub(r"#+\s*", " ", without_html)
+    return len(re.sub(r"\s+", "", without_markdown))
 
 
 def _usage_error_payload(
@@ -479,6 +1018,8 @@ def _rewrite_prompt_for(
     primary: NormalizedContent | None,
     scores: dict[str, HotnessScore],
     skill: WechatRewriteSkill,
+    *,
+    outline: SourceOutline | None = None,
 ) -> str:
     if primary is None:
         return skill.build_task_prompt({})
@@ -499,6 +1040,7 @@ def _rewrite_prompt_for(
             "url": primary.url,
             "metrics": metrics,
             "raw_payload": primary.raw_payload,
+            "source_outline": _source_outline_prompt(outline),
         }
     )
 
@@ -559,7 +1101,7 @@ def _source_key_sections_html(source_text: str | None) -> str:
     )
     return f"""<h2>原文关键信息展开</h2>
 
-<p>为了避免把长文压缩成短摘要，下面按原文顺序保留主要信息块，并用更适合公众号阅读的表达重新组织。</p>
+<p>为了避免把长文压缩成短摘要，下面按原文顺序保留主要段落，并用更适合公众号阅读的表达重新组织。</p>
 
 {body}"""
 

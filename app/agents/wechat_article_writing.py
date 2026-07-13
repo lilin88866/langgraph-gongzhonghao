@@ -14,11 +14,11 @@ from app.tools.qwen_rewrite_client import QwenRewriteClient, is_quota_error, is_
 from app.tools.api import WechatRewriteSkill
 
 
-REWRITE_SIMILARITY_MIN = 25
-REWRITE_SIMILARITY_MAX = 35
+REWRITE_SIMILARITY_MIN = 20
+REWRITE_SIMILARITY_MAX = 25
 LONG_REWRITE_SOURCE_THRESHOLD = 3000
-LONG_REWRITE_TARGET_RATIO = 0.5
-LONG_REWRITE_MAX_RATIO = 0.9
+LONG_REWRITE_TARGET_RATIO = 0.7
+LONG_REWRITE_MAX_RATIO = 0.8
 
 
 @dataclass(slots=True)
@@ -192,7 +192,7 @@ def _source_outline_prompt(outline: SourceOutline | None) -> str:
     if outline is None or not outline.blocks:
         return "未生成原文骨架，请严格按照原文正文顺序改写。"
     length_line = (
-        f"目标正文长度：{outline.min_length}-{outline.max_length} 字（约原文 50%-90%），禁止超过原文长度。"
+        f"目标正文长度：{outline.min_length}-{outline.max_length} 字（约原文 70%-80%），禁止超过原文长度。"
         if outline.min_length > 0 and outline.max_length > 0
         else "原文未达到长文阈值，保持主要信息完整即可。"
     )
@@ -554,7 +554,7 @@ Qwen 改写调用失败：{_clean_text(str(exc))}
 
 
 def _prefer_local_rewrite() -> bool:
-    return os.getenv("QWEN_REWRITE_PREFER_LOCAL", "1").lower() not in {"0", "false", "no"}
+    return os.getenv("QWEN_REWRITE_PREFER_LOCAL", "0").lower() in {"1", "true", "yes"}
 
 
 def _allow_cloud_after_local_failure() -> bool:

@@ -3892,6 +3892,8 @@ def _is_valid_wechat_candidate(content: NormalizedContent) -> bool:
         return False
     if not _has_usable_article_title(content.title):
         return False
+    if _title_matches_wechat_account_name(content):
+        return False
     if _looks_like_marketing_wechat_article(content):
         return False
     if _looks_like_hollow_wechat_article(content):
@@ -3912,6 +3914,25 @@ def _has_usable_article_title(title: str | None) -> bool:
         return False
     normalized = re.sub(r"\s+", "", cleaned).lower()
     return normalized not in {value.lower() for value in CANDIDATE_PLACEHOLDER_TITLES}
+
+
+def _compact_wechat_title_key(value: str | None) -> str:
+    cleaned = _plain_text(str(value or "")).strip(" \t\r\n-—_｜|：:，,。.")
+    return re.sub(r"[\W_]+", "", cleaned, flags=re.UNICODE).lower()
+
+
+def _title_matches_wechat_account_name(content: NormalizedContent) -> bool:
+    title_key = _compact_wechat_title_key(content.title)
+    if not title_key:
+        return False
+    account = content.raw_payload.get("account") if isinstance(content.raw_payload.get("account"), dict) else {}
+    candidate_names = [
+        content.author,
+        account.get("nickname"),
+        account.get("wechat_name"),
+        account.get("name"),
+    ]
+    return any(title_key == _compact_wechat_title_key(str(name)) for name in candidate_names if name)
 
 
 def _looks_like_marketing_wechat_article(content: NormalizedContent) -> bool:
@@ -4558,7 +4579,7 @@ def _rewrite_workspace_html() -> str:
   <script>
     const lightLabels = { green: "绿灯", yellow: "黄灯", red: "红灯" };
     const candidatesById = new Map();
-    const candidateCacheKey = "langgraph-study:rewrite:candidates:v4";
+    const candidateCacheKey = "langgraph-study:rewrite:candidates:v5";
     const autoBackgroundRefresh = false;
     let currentArticleMarkdown = "";
     let currentSourceImages = [];

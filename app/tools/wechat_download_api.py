@@ -456,7 +456,7 @@ class WechatDownloadApiClient:
     ) -> dict[str, Any]:
         article = item.get("article") if isinstance(item.get("article"), dict) else item
         account = _pick_dict(item, "gzh", "account")
-        title = _pick_str(article, "title", "name") or plan.query or ""
+        title = _pick_str(article, "title", "name") or ""
         html = _pick_str(article, "content", "html", "article_html", "text", "rich_media_content") or ""
         text = _html_to_text(_pick_str(article, "text", "plain_content", "content", "digest", "summary", "abstract", "desc") or "")
         url = _pick_str(article, "url", "link", "content_url")

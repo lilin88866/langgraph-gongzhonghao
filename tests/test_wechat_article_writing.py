@@ -289,7 +289,7 @@ class WechatArticleWritingAgentTest(unittest.TestCase):
 
         self.assertIn("原文正文长度约", article.rewrite_prompt)
         self.assertIn("应控制在", article.rewrite_prompt)
-        self.assertIn("约为原文 50%-90%", article.rewrite_prompt)
+        self.assertIn("约为原文 70%-80%", article.rewrite_prompt)
         self.assertIn("禁止超过原文长度", article.rewrite_prompt)
         self.assertIn("原文关键信息展开", article.body_markdown)
         self.assertIn("原文要点 1", article.body_markdown)
@@ -336,7 +336,7 @@ class WechatArticleWritingAgentTest(unittest.TestCase):
             article = WechatArticleWritingAgent().invoke(state)["generated_article"]
 
         self.assertEqual(execute.call_count, 1)
-        self.assertIn("先看这篇文章在讲什么", article.body_markdown)
+        self.assertIn("把原文主线补完整", article.body_markdown)
         self.assertIn("Agent 工程实践要讲清目标", article.body_markdown)
         self.assertNotIn("原文段落 1", article.body_markdown)
         self.assertNotIn("信息块", article.body_markdown)
@@ -344,8 +344,7 @@ class WechatArticleWritingAgentTest(unittest.TestCase):
         assert article.llm_usage is not None
         self.assertTrue(article.llm_usage["length_retry"]["accepted"])
         self.assertTrue(article.llm_usage["length_retry"]["deterministic_supplement"])
-        self.assertGreaterEqual(article.llm_usage["similarity_retry"]["similarity"], 25)
-        self.assertLessEqual(article.llm_usage["similarity_retry"]["similarity"], 35)
+        self.assertNotIn("similarity_retry", article.llm_usage)
 
     def test_agent_switches_to_source_outline_when_llm_rewrite_is_too_different(self) -> None:
         source_text = "Claude Loops 的核心是先写清目标，再让模型执行、检查、修正，并通过低 Token 的上下文管理降低成本。"
@@ -391,7 +390,7 @@ class WechatArticleWritingAgentTest(unittest.TestCase):
         self.assertFalse(article.llm_usage["similarity_retry"]["accepted"])
         self.assertTrue(article.llm_usage["similarity_retry"]["deterministic_fallback"])
         self.assertTrue(article.llm_usage["similarity_retry"]["forced_source_preserving_fallback"])
-        self.assertGreaterEqual(article.llm_usage["similarity_retry"]["similarity"], 25)
+        self.assertGreaterEqual(article.llm_usage["similarity_retry"]["similarity"], 20)
 
     def test_agent_uses_source_preserving_fallback_when_similarity_repair_fails(self) -> None:
         source_text = "Claude Loops 的核心是先写清目标，再让模型执行、检查、修正，并通过低 Token 的上下文管理降低成本。" * 12
@@ -442,7 +441,7 @@ class WechatArticleWritingAgentTest(unittest.TestCase):
         self.assertNotIn("继续讲另一个产品增长故事", article.body_markdown)
         assert article.llm_usage is not None
         self.assertTrue(article.llm_usage["similarity_retry"]["forced_source_preserving_fallback"])
-        self.assertGreaterEqual(article.llm_usage["similarity_retry"]["similarity"], 25)
+        self.assertGreaterEqual(article.llm_usage["similarity_retry"]["similarity"], 20)
 
     def test_compliance_report_flags_high_similarity(self) -> None:
         source = NormalizedContent(
@@ -463,7 +462,7 @@ class WechatArticleWritingAgentTest(unittest.TestCase):
 
         self.assertIn("与原文相似度：", report)
         self.assertIn("合规判断：需人工复核", report)
-        self.assertIn("目标相似度为 25%-35%", report)
+        self.assertIn("目标相似度为 20%-25%", report)
 
     def test_execute_rewrite_prompt_falls_back_to_ollama_on_quota_error(self) -> None:
         primary = Mock()
@@ -518,10 +517,14 @@ class WechatArticleWritingAgentTest(unittest.TestCase):
         primary.rewrite_with_usage.assert_called_once_with("rewrite prompt")
         fallback.rewrite_with_usage.assert_called_once_with("rewrite prompt")
 
-    def test_execute_rewrite_prompt_prefers_local_fallback_by_default(self) -> None:
+    def test_execute_rewrite_prompt_prefers_cloud_by_default(self) -> None:
         primary = Mock()
         primary.model = "qwen-primary"
         primary.base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1/"
+        primary.rewrite_with_usage.return_value = QwenRewriteResult(
+            content="云端千问改写结果",
+            usage={"model": "qwen-primary", "prompt_tokens": 10, "completion_tokens": 20, "total_tokens": 30},
+        )
         fallback = Mock()
         fallback.model = "qwen2.5:7b"
         fallback.base_url = "http://localhost:11434/v1/"
@@ -537,12 +540,12 @@ class WechatArticleWritingAgentTest(unittest.TestCase):
         ):
             result, usage = _execute_rewrite_prompt("rewrite prompt")
 
-        self.assertEqual(result, "本地优先改写结果")
+        self.assertEqual(result, "云端千问改写结果")
         assert usage is not None
-        self.assertEqual(usage["provider"], "fallback")
-        self.assertEqual(usage["base_url"], "http://localhost:11434/v1/")
-        fallback.rewrite_with_usage.assert_called_once_with("rewrite prompt")
-        primary.rewrite_with_usage.assert_not_called()
+        self.assertEqual(usage["provider"], "primary")
+        self.assertEqual(usage["base_url"], "https://dashscope.aliyuncs.com/compatible-mode/v1/")
+        primary.rewrite_with_usage.assert_called_once_with("rewrite prompt")
+        fallback.rewrite_with_usage.assert_not_called()
 
     def test_execute_rewrite_prompt_does_not_fallback_on_non_quota_error(self) -> None:
         primary = Mock()

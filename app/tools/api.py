@@ -132,7 +132,7 @@ class WechatRewriteSkill:
 3. 保留核心事实、术语、方法价值和必要链接；不得编造案例、数据、发布日期、官方结论或授权信息。
 4. LLM 只负责表达润色、句式替换、局部解释补充和公众号排版；不要重新设计选题、不要另起案例、不要把原文改成另一篇教程。
 5. 原文正文长度约 {source_text_length} 字。{_length_requirement_text(source_text_length, minimum_rewrite_length)}
-6. 相似度目标区间是 25%-35%。低于 25% 说明改动过大，需要恢复原文结构和关键表述；高于 35% 说明过于接近，需要替换连续句式和局部表达。降重主要通过换句式、换类比、调整段落表达和补少量解释完成，不连续复用原文句子。
+6. 相似度目标区间是 20%-25%。低于 20% 说明改动过大，需要恢复原文结构和关键表述；高于 25% 说明过于接近，需要替换连续句式和局部表达。降重主要通过换句式、换类比、调整段落表达和补少量解释完成，不连续复用原文句子。
 7. 如果原文正文较短，只能基于标题、摘要和可复核事实扩写；不确定内容写入“来源与复核提醒”。
 8. 正文必须是微信富文本 HTML, 只使用 <section>、<p>、<h2>、<ul>、<ol>、<li>、<blockquote>、<strong>、<span>、<br>，并使用内联 style。
 9. {_inline_image_requirement_text(source_image_count, source_text_length)}
@@ -243,13 +243,13 @@ def _extract_keywords(rules: str) -> list[str]:
 
 def _minimum_rewrite_length(source_text_length: int) -> int:
     if source_text_length >= 3000:
-        return int(source_text_length * 0.5)
+        return int(source_text_length * 0.7)
     return 0
 
 
 def _maximum_rewrite_length(source_text_length: int) -> int:
     if source_text_length >= 3000:
-        return int(source_text_length * 0.9)
+        return int(source_text_length * 0.8)
     return 0
 
 
@@ -367,7 +367,7 @@ def _length_requirement_text(source_text_length: int, minimum_rewrite_length: in
         maximum_rewrite_length = _maximum_rewrite_length(source_text_length)
         return (
             f"这是长文改写，公众号改写正文去除 HTML 标签后的正文长度应控制在 {minimum_rewrite_length}-{maximum_rewrite_length} 字，"
-            "约为原文 50%-90%；不是越长越好，禁止超过原文长度。必须保留原文的小标题、论证顺序、关键解释、示例和结论。"
+            "约为原文 70%-80%；不是越长越好，最好落在该区间内，禁止超过原文长度。必须保留原文的小标题、论证顺序、关键解释、示例和结论。"
         )
     return "原文未达到长文阈值，仍需保留主要信息，不要把完整段落压缩成几句摘要。"
 

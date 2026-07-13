@@ -1,0 +1,9 @@
+# PaddleOCR local OCR runtime.
+#
+# Install paddlepaddle from the official CPU wheel index first:
+#   .venv/bin/pip install paddlepaddle==3.2.0 -i https://www.paddlepaddle.org.cn/packages/stable/cpu/
+#
+# Then install the remaining OCR package dependencies:
+#   .venv/bin/pip install -r requirements-ocr.txt
+
+paddleocr

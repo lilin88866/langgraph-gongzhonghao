@@ -68,7 +68,7 @@ class WechatRewriteSkillTest(unittest.TestCase):
         self.assertIn("必须先沿“确定性原文骨架”逐段润色", prompt)
         self.assertIn("正文里禁止出现任何内部实现标签、系统说明或失败兜底说明", prompt)
         self.assertIn("先讲 CLAUDE.md 的使用场景", prompt)
-        self.assertIn("相似度目标区间是 25%-35%", prompt)
+        self.assertIn("相似度目标区间是 20%-25%", prompt)
         self.assertIn("AI 知识型/讲解型订阅号", prompt)
         self.assertIn("LLM 只负责表达润色", prompt)
         self.assertIn("配图占位卡片", prompt)

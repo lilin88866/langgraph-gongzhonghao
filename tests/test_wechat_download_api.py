@@ -103,6 +103,30 @@ class WechatDownloadApiClientTest(unittest.TestCase):
         self.assertEqual(raw.raw_payload["metrics"]["reads"], 1024)
         self.assertEqual(raw.raw_payload["account"]["fakeid"], "fake_123")
 
+    def test_article_title_does_not_fallback_to_subscription_query(self) -> None:
+        client = FakeWechatDownloadApiClient(
+            get_responses={
+                "/api/public/articles/search": [
+                    {
+                        "list": [
+                            {
+                                "aid": "article_without_title",
+                                "link": "https://mp.weixin.qq.com/s/no-title",
+                                "plain_content": "AI Agent 实践指南。",
+                            }
+                        ]
+                    }
+                ],
+            }
+        )
+        client.default_fakeids = ["fake_123"]
+        plan = SourcePlan(platform=Platform.WECHAT, dimension=ApiDimension.SEARCH_QUERY, query="AI 前沿", page_size=10)
+
+        [raw] = client.fetch(plan)
+
+        self.assertEqual(raw.raw_payload["title"], "")
+        self.assertNotEqual(raw.raw_payload["title"], "AI 前沿")
+
     def test_article_metrics_accept_wechat_stat_field_variants(self) -> None:
         client = FakeWechatDownloadApiClient(
             get_responses={

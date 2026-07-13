@@ -430,6 +430,58 @@ class ServerTest(unittest.TestCase):
 
         self.assertEqual(_rewrite_candidates(state), [])
 
+    def test_rewrite_candidates_skip_titles_that_match_account_name(self) -> None:
+        state = {
+            "normalized_contents": [
+                NormalizedContent(
+                    platform=Platform.WECHAT,
+                    content_id="title-author-match",
+                    author="AI 前沿",
+                    title="AI 前沿",
+                    text="AI Agent 实践指南。" * 80,
+                    media_type=MediaType.ARTICLE,
+                    published_at=None,
+                    metrics=EngagementMetrics(reads=10000),
+                    url="https://mp.weixin.qq.com/s/title-author-match",
+                    source_api="wechat-download-api",
+                    raw_payload={"account": {"fakeid": "fake_123", "nickname": "AI 前沿"}},
+                ),
+                NormalizedContent(
+                    platform=Platform.WECHAT,
+                    content_id="title-nickname-match",
+                    author="",
+                    title="AI｜前沿",
+                    text="AI Agent 实践指南。" * 80,
+                    media_type=MediaType.ARTICLE,
+                    published_at=None,
+                    metrics=EngagementMetrics(reads=9000),
+                    url="https://mp.weixin.qq.com/s/title-nickname-match",
+                    source_api="wechat-download-api",
+                    raw_payload={"account": {"fakeid": "fake_456", "nickname": "AI 前沿"}},
+                ),
+            ],
+            "hotness_scores": [
+                HotnessScore(
+                    content_id="title-author-match",
+                    hotness_score=80.0,
+                    velocity_score=0.0,
+                    engagement_quality_score=0.0,
+                    platform_weight=1.0,
+                    reason="标题被订阅号名污染",
+                ),
+                HotnessScore(
+                    content_id="title-nickname-match",
+                    hotness_score=70.0,
+                    velocity_score=0.0,
+                    engagement_quality_score=0.0,
+                    platform_weight=1.0,
+                    reason="标题被账号昵称污染",
+                ),
+            ],
+        }
+
+        self.assertEqual(_rewrite_candidates(state), [])
+
     def test_rewrite_candidates_skip_hollow_articles_but_keep_concrete_guides(self) -> None:
         state = {
             "normalized_contents": [

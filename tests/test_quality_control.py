@@ -154,7 +154,7 @@ class QualityControlAgentTest(unittest.TestCase):
                 "### 公众号改写正文\n\n"
                 "<section><p>正文段落。</p><section><p>配图建议：流程图</p></section></section>\n\n"
                 "### 配图建议\n\n"
-                "1. 正文配图复核：流程图。"
+                "1. 封面图：流程图。"
             ),
             source_trend_id="trend-1",
             source_content_ids=["content-1"],

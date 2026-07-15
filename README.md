@@ -30,6 +30,203 @@ Run the demo workflow:
 python -m app.graphs.ai_hotspot_graph
 ```
 
+## 工程流程总览
+
+本工程可以按四条主线理解：开发服务启动流、AI 热点多 Agent 流、微信公众号改写工作台流，以及 skills 辅助工具流。
+
+### 1. 开发服务启动流
+
+推荐入口是：
+
+```bash
+python scripts/start_dev_server.py
+```
+
+启动后会完成以下动作：
+
+1. 读取 `.env` 配置。
+2. 启动或检查外部 `wechat-download-api` 服务。
+3. 启动公众号订阅文章刷新调度。
+4. 启动 `app.server:app` FastAPI 服务。
+5. 暴露工作台页面和 API，例如 `/workflow/rewrite`、`/workflow/article/html`、`/workflow/video/agent`、`/workflow/graph`。
+
+### 2. AI 热点多 Agent 主流程
+
+完整热点分析链路是：
+
+```text
+任务调度
+  -> 数据源发现
+  -> 平台采集
+  -> 数据标准化
+  -> AI 相关性识别
+  -> 热度评分
+  -> 趋势分析
+  -> 产品洞察
+  -> 选题策略
+  -> 质量控制
+  -> 报告生成
+  -> 人工审核
+```
+
+主要映射关系：
+
+| 阶段 | 模块 |
+| --- | --- |
+| 任务调度 | `app/agents/task_router.py` |
+| 数据源发现 | `app/agents/source_discovery.py` |
+| 平台采集 | `app/agents/platform_collection.py` |
+| 数据标准化 | `app/agents/normalization.py` |
+| AI 相关性识别 | `app/agents/ai_relevance.py` |
+| 热度评分 | `app/agents/hotness_scoring.py` |
+| 趋势分析 | `app/agents/trend_analysis.py` |
+| 产品洞察 | `app/agents/product_insight.py` |
+| 选题策略 | `app/agents/content_strategy.py` |
+| 质量控制 | `app/agents/quality_control.py` |
+| 报告生成 | `app/agents/report_generation.py` |
+
+workflow 入口在 `app/graphs/ai_hotspot_graph.py`。安装 LangGraph 时可编译真实 graph；未安装时使用顺序执行 fallback，方便本地调试。
+
+### 3. 微信公众号数据下载流
+
+微信公众号数据由 `app/tools/wechat_download_api.py` 对接本地自建 `wechat-download-api` 服务。这个文件只做底层下载和字段标准化，不混入热榜、账号评分或 HTML 生成逻辑。
+
+主要链路：
+
+```text
+wechat-download-api
+  -> 搜公众号 / 订阅公众号 / 读取订阅列表
+  -> 拉文章列表
+  -> 拉文章详情
+  -> 标准化成 RawContent / NormalizedContent
+  -> 写入本地缓存和 workflow state
+```
+
+相关缓存：
+
+- `.cache/wechat_article_lists`：公众号文章列表缓存。
+- `.cache/wechat_article_details`：文章详情缓存。
+- `.cache/workflow_rewrite_state.json`：改写工作台候选 workflow 缓存。
+
+### 4. 微信公众号改写工作台流
+
+浏览器入口：
+
+```text
+/workflow/rewrite
+```
+
+候选文章来源：
+
+| 接口 | 用途 |
+| --- | --- |
+| `/workflow/rewrite/candidates` | 默认改写候选 |
+| `/workflow/wechat/articles` | 今日订阅流，默认读本地 workflow 缓存 |
+| `/workflow/rewrite/hot-candidates` | `wechat-10w-hot` 高热榜 |
+| `/workflow/rewrite/knowledge-candidates` | 知识型优先候选 |
+
+手动更新订阅号文章时走：
+
+```text
+/workflow/rewrite/subscriptions/refresh/stream
+```
+
+更新流程：
+
+```text
+清理旧缓存
+  -> 调 wechat-download-api 拉订阅文章
+  -> 标准化
+  -> AI 相关性识别
+  -> 热度评分
+  -> 质量控制
+  -> 写 workflow 缓存
+  -> 返回候选列表
+```
+
+用户选择一篇文章改写时走：
+
+```text
+/workflow/rewrite/selected/stream
+```
+
+改写流程：
+
+```text
+读取候选缓存
+  -> 根据 content_id 找文章
+  -> 补拉全文详情
+  -> 提取原文图片
+  -> 图片 OCR 增强
+  -> 调 wechat-rewrite Agent
+  -> 长度和相似度检查
+  -> 质量控制
+  -> 返回 Markdown 和 HTML
+```
+
+改写核心在 `app/agents/wechat_article_writing.py`，主要负责生成原文骨架、构建改写 prompt、调用 Qwen 或 fallback、本地兜底稿、相似度检测、长度检测和合规报告。
+
+### 5. Skills 辅助工具流
+
+`skills/local_wechat_feed.py` 是当前本地微信数据的统一适配层，供热榜、HTML 报告和账号分析复用。
+
+支持的数据源：
+
+| source | 数据来源 |
+| --- | --- |
+| `auto` | 自动优先尝试 feed / hot / cache / download |
+| `cache` | `/workflow/rewrite/candidates` |
+| `feed` | `/workflow/wechat/articles` |
+| `hot` | `/workflow/rewrite/hot-candidates` |
+| `download` | 直接调 `WechatDownloadApiClient` |
+
+常用命令：
+
+```bash
+# 本地热榜 Markdown
+python3 skills/wechat-10w-hot/scripts/fetch_hot_articles.py --type AI --source feed --limit 10 --output-format markdown
+
+# 生成本地热榜 HTML
+python3 skills/wechat-10w-hot/scripts/generate_hot_html.py --source feed --type AI --limit 10 --output 本地高热榜.html
+
+# 分析某个公众号账号
+python3 skills/wechat-account-analyzer/scripts/wechat_analyzer.py 智能体AI --source auto --limit 100
+```
+
+### 6. 视频生成辅助流
+
+视频入口是 `/workflow/video/agent`。流程是：
+
+```text
+用户输入视频任务
+  -> 判断任务类型
+  -> 搜教材 PDF 或使用本地素材
+  -> 生成视频脚本
+  -> 生成配音、字幕、分镜
+  -> 调 video-renderer / Remotion
+  -> 输出视频、音频、字幕和帧图
+  -> 人工复核
+```
+
+### 总体数据流
+
+```text
+外部数据源
+  -> app/tools/* 下载适配器
+  -> RawContent
+  -> NormalizationAgent
+  -> NormalizedContent
+  -> AIRelevanceAgent
+  -> HotnessScoringAgent
+  -> TrendAnalysisAgent
+  -> ProductInsightAgent
+  -> ContentStrategyAgent
+  -> QualityControlAgent
+  -> Report / Article / Rewrite / Hot List / Account Analysis / Video
+```
+
+一句话总结：本工程先把微信公众号等平台内容下载成本地统一数据，再通过多 Agent 做 AI 相关性、热度、趋势和质量判断，最后把结果用于公众号改写、热榜、账号分析、报告和视频生成。
+
 ## Development Server
 
 Install the optional server dependencies:

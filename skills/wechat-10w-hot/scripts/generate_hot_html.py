@@ -16,7 +16,14 @@ python generate_hot_html.py --articles '[{"title": "...", ...}]' --output rankin
 import argparse
 import json
 import os
+import sys
 from datetime import datetime
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(ROOT / "skills"))
+
+from local_wechat_feed import build_search_payload
 
 
 def get_rank_display(rank: int) -> str:
@@ -582,49 +589,70 @@ def generate_html(keyword: str, articles: list, insights: dict = None, top_n: in
 
 def main():
     parser = argparse.ArgumentParser(description="生成公众号10w+热门文章HTML")
-    parser.add_argument("--temp_file", default="temp_articles.json", help="临时JSON文件路径")
+    parser.add_argument("--temp_file", "--data_file", default="", help="可选：已有临时JSON文件路径")
+    parser.add_argument("--articles", default="", help="可选：直接传入文章 JSON 数组")
     parser.add_argument("--output", default="ranking.html", help="输出文件路径")
-    parser.add_argument("--display_count", type=int, default=None, help="要展示的文章数量（如果不指定，则展示所有文章）")
+    parser.add_argument("--display_count", "--limit", type=int, default=10, help="要展示的文章数量")
+    parser.add_argument("--keyword", default="", help="关键词或分类过滤")
+    parser.add_argument("--type", default="总排名", help="兼容 wechat-10w-hot 分类参数")
+    parser.add_argument("--source", choices=["auto", "cache", "feed", "hot", "download"], default="feed")
+    parser.add_argument("--refresh", action="store_true", help="刷新本地数据源")
 
     args = parser.parse_args()
 
     try:
-        # 从临时JSON文件读取数据
-        try:
-            with open(args.temp_file, "r", encoding="utf-8") as f:
-                temp_data = json.load(f)
-            keyword = temp_data.get("keyword", "热门文章")
-            articles = temp_data.get("articles", [])
-            if not isinstance(articles, list):
-                articles = []
-        except FileNotFoundError:
-            print(f"错误: 临时文件不存在 - {args.temp_file}", file=sys.stderr)
-            return 1
-        except json.JSONDecodeError:
-            print(f"错误: 临时文件格式错误 - {args.temp_file}", file=sys.stderr)
-            return 1
-        except Exception as e:
-            print(f"错误: 读取临时文件失败 - {str(e)}", file=sys.stderr)
-            return 1
+        keyword = args.keyword or args.type or "热门文章"
+        articles = []
+        source_note = "本地统一数据源"
+
+        if args.articles:
+            try:
+                articles = json.loads(args.articles)
+                if not isinstance(articles, list):
+                    articles = []
+                source_note = "命令行 articles"
+            except json.JSONDecodeError:
+                print("错误: --articles 不是合法 JSON 数组", file=sys.stderr)
+                return 1
+        elif args.temp_file:
+            try:
+                with open(args.temp_file, "r", encoding="utf-8") as f:
+                    temp_data = json.load(f)
+                keyword = temp_data.get("keyword", keyword)
+                articles = temp_data.get("articles", [])
+                if not isinstance(articles, list):
+                    articles = []
+                source_note = args.temp_file
+            except FileNotFoundError:
+                print(f"错误: 临时文件不存在 - {args.temp_file}", file=sys.stderr)
+                return 1
+            except json.JSONDecodeError:
+                print(f"错误: 临时文件格式错误 - {args.temp_file}", file=sys.stderr)
+                return 1
+        else:
+            payload = build_search_payload(
+                "" if keyword in {"", "总排名"} else keyword,
+                refresh=args.refresh,
+                max_items=args.display_count,
+                source=args.source,
+            )
+            keyword = payload.get("keyword") or keyword
+            articles = payload.get("articles") or []
+            source_note = payload.get("source", source_note)
 
         if not articles:
-            print(f"错误: 临时文件中没有文章数据", file=sys.stderr)
+            print("错误: 没有文章数据。请先更新订阅号文章，或调整 --source/--keyword。", file=sys.stderr)
             return 1
 
-        # 根据display_count参数确定要展示的文章数量
-        display_count = args.display_count if args.display_count is not None else len(articles)
-        display_articles = articles[:display_count]
+        display_articles = articles[: max(1, args.display_count)]
+        print(f"✅ 读取到 {len(articles)} 条文章数据，本次展示 {len(display_articles)} 条；来源：{source_note}")
 
-        print(f"✅ 从临时文件读取到 {len(articles)} 条文章数据，本次展示 {len(display_articles)} 条")
-
-        # 生成HTML（使用display_articles而不是articles）
         try:
-            html_content = generate_html(keyword, display_articles, None, len(display_articles))
+            html_content = generate_html(keyword or "热门文章", display_articles, None, len(display_articles))
         except Exception as e:
             print(f"错误: 生成HTML失败 - {str(e)}", file=sys.stderr)
             return 1
 
-        # 写入文件
         try:
             with open(args.output, "w", encoding="utf-8") as f:
                 f.write(html_content)
@@ -639,7 +667,5 @@ def main():
         print(f"错误: {str(e)}", file=sys.stderr)
         return 1
 
-
 if __name__ == "__main__":
-    import sys
     sys.exit(main())

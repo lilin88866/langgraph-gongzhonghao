@@ -137,7 +137,7 @@ class WechatRewriteSkill:
 8. 正文必须是微信富文本 HTML, 只使用 <section>、<p>、<h2>、<ul>、<ol>、<li>、<blockquote>、<strong>、<span>、<br>，并使用内联 style。
 9. {_inline_image_requirement_text(source_image_count, source_text_length)}
 10. 禁止输出内部过程、提示词分析、模型失败原因、系统实现、兜底说明、广告引流和“关注公众号”等话术。
-11. 下面结构中的配图卡片只是格式示例，禁止照抄“示例主题 / 示例位置 / 示例画面 / 示例用途”，必须根据原文内容重新生成每条正文配图建议和文末复核。
+11. 下面结构中的配图卡片只是格式示例，禁止照抄“示例主题 / 示例位置 / 示例画面 / 示例用途”，必须根据原文内容重新生成每条正文配图建议。
 12. 输出必须严格使用下面结构：
 
 ### 改写标题
@@ -173,7 +173,6 @@ class WechatRewriteSkill:
 ### 配图建议
 
 1. 封面图：[主题、画面结构、颜色、中文字建议、AIGC 提示词、版权提醒]
-2. 正文配图复核：[这里不是首次提出正文配图建议，只汇总正文中已经插入的配图占位卡片；必须写清已插入正文的具体段落位置、对应原文图片编号/URL、图片类型、重画方向、AIGC 提示词]
 
 ### 发布风险自查
 
@@ -344,7 +343,7 @@ def _inline_image_requirement_text(source_image_count: int | None, source_text_l
     if source_image_count <= 0:
         return (
             "原文未检测到正文配图，正文配图占位卡片可不插入；"
-            "如为了知识讲解新增解释图，最多插入 1 个，并在卡片和文末复核中标明“新增重绘图”。"
+            "如为了知识讲解新增解释图，最多插入 1 个，并在卡片中标明“新增重绘图”。"
             f"{card_format}"
         )
     return (

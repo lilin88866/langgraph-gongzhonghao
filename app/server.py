@@ -4817,10 +4817,28 @@ def _rewrite_workspace_html() -> str:
       }
     }
 
-    async function fetchJson(url, options = {}) {
-      const response = await fetch(url, options);
+    async function fetchJson(url, options = {}, attempt = 0) {
+      const requestUrl = attempt > 0 ? withFetchRetryCacheBust(url) : url;
+      const requestOptions = { cache: "no-store", ...options };
+      let response;
+      try {
+        response = await fetch(requestUrl, requestOptions);
+      } catch (error) {
+        if (attempt < 1 && isRetryableFetchError(error)) {
+          return fetchJson(url, options, attempt + 1);
+        }
+        throw error;
+      }
       const contentType = response.headers.get("content-type") || "";
-      const bodyText = await response.text();
+      let bodyText;
+      try {
+        bodyText = await response.text();
+      } catch (error) {
+        if (attempt < 1 && isRetryableFetchError(error)) {
+          return fetchJson(url, options, attempt + 1);
+        }
+        throw error;
+      }
       if (!response.ok) {
         throw new Error(formatFetchError(response.status, bodyText, response.statusText));
       }
@@ -4832,6 +4850,20 @@ def _rewrite_workspace_html() -> str:
       } catch (error) {
         throw new Error(`JSON 解析失败：${error}`);
       }
+    }
+
+    function isRetryableFetchError(error) {
+      const text = String(error && (error.message || error) || "");
+      return text.includes("Content-Length")
+        || text.includes("Failed to fetch")
+        || text.includes("NetworkError")
+        || text.includes("network response")
+        || text.includes("Load failed");
+    }
+
+    function withFetchRetryCacheBust(url) {
+      const separator = url.includes("?") ? "&" : "?";
+      return `${url}${separator}_retry=${Date.now()}`;
     }
 
     function formatFetchError(status, bodyText, statusText) {

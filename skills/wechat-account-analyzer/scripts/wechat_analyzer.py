@@ -15,12 +15,15 @@ sys.path.insert(0, str(ROOT / "skills"))
 from local_wechat_feed import build_search_payload  # noqa: E402
 
 
-def analyze_account(account: str, *, refresh: bool = False) -> dict:
-    payload = build_search_payload(account, refresh=refresh, max_items=100)
+def analyze_account(account: str, *, refresh: bool = False, source: str = "auto", limit: int = 100) -> dict:
+    payload = build_search_payload(account, refresh=refresh, max_items=limit, source=source)
     articles = payload.get("articles") or []
     if not articles:
-        fallback = build_search_payload("", refresh=refresh, max_items=100).get("articles") or []
+        fallback_payload = build_search_payload("", refresh=refresh, max_items=limit, source=source)
+        fallback = fallback_payload.get("articles") or []
         articles = [item for item in fallback if account in item.get("author", "") or account in item.get("title", "")]
+        if not payload.get("source"):
+            payload = fallback_payload
     total_reads = sum(int(item.get("clicksCount") or 0) for item in articles)
     total_likes = sum(int(item.get("likeCount") or 0) for item in articles)
     total_comments = sum(int(item.get("commentCount") or 0) for item in articles)
@@ -39,7 +42,8 @@ def analyze_account(account: str, *, refresh: bool = False) -> dict:
         "score": score,
         "grade": grade(score),
         "articles": articles[:10],
-        "source": "langgraph-study local wechat-download-api",
+        "source": payload.get("source") or "langgraph-study local wechat-download-api",
+        "source_mode": source,
     }
 
 
@@ -96,13 +100,15 @@ def main() -> int:
     parser.add_argument("account", nargs="?", default="")
     parser.add_argument("--account", dest="account_option", default="")
     parser.add_argument("--refresh", action="store_true")
+    parser.add_argument("--source", choices=["auto", "cache", "download", "feed", "hot"], default="auto")
+    parser.add_argument("--limit", type=int, default=100)
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
     account = args.account_option or args.account
     if not account:
         print("请提供公众号名称，例如：python scripts/wechat_analyzer.py AI前沿", file=sys.stderr)
         return 2
-    result = analyze_account(account, refresh=args.refresh)
+    result = analyze_account(account, refresh=args.refresh, source=args.source, limit=args.limit)
     if args.json:
         print(json.dumps(result, ensure_ascii=False, indent=2))
     else:

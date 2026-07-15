@@ -65,10 +65,6 @@ class MockContentApiClient:
         }
 
 
-def build_mock_clients(platforms: list[Platform]) -> dict[Platform, ContentApiClient]:
-    return {platform: MockContentApiClient(platform) for platform in platforms}
-
-
 def _default_media_type(platform: Platform, dimension: ApiDimension) -> str:
     if dimension == ApiDimension.ACCOUNT_INFO:
         return "account"

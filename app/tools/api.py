@@ -213,24 +213,6 @@ def _workflow_prompt_for(skills_root: Path, skill_name: str) -> str:
     return WORKFLOW_PROMPT_RULES.get(skill_name, "")
 
 
-def _read_skill_summary(skill_dir: Path, *, limit: int = 1200) -> str:
-    skill_file = skill_dir / "SKILL.md"
-    if not skill_file.exists():
-        return ""
-    content = skill_file.read_text(encoding="utf-8")
-    description = ""
-    match = re.search(r"^description:\s*(.+)$", content, re.MULTILINE)
-    if match:
-        description = match.group(1).strip()
-    content = re.sub(r"^---\n.*?\n---\n", "", content, flags=re.DOTALL).strip()
-    content = "\n".join(line.rstrip() for line in content.splitlines() if line.strip())
-    if len(content) > limit:
-        content = content[:limit].rstrip() + "\n..."
-    if description and description not in content:
-        return f"职责：{description}\n{content}"
-    return content
-
-
 def _extract_keywords(rules: str) -> list[str]:
     keywords: list[str] = []
     for match in re.finditer(r"^\d+\.\s*([^：:\n]+)[：:]", rules, re.MULTILINE):

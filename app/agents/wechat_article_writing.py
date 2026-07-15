@@ -81,6 +81,22 @@ class WechatArticleWritingAgent:
         )
         if isinstance(llm_usage, dict) and isinstance(llm_usage.get("similarity_retry"), dict):
             _emit_rewrite_stage(state, "rewrite-fallback", "相似度低于阈值，已切换为贴近原文骨架的保底稿。")
+        rewrite_result, llm_usage = _repair_high_similarity_rewrite_if_needed(
+            rewrite_result,
+            llm_usage,
+            primary=primary,
+            rewrite_prompt=rewrite_prompt,
+        )
+        if isinstance(llm_usage, dict) and isinstance(llm_usage.get("high_similarity_retry"), dict):
+            high_retry = llm_usage["high_similarity_retry"]
+            if high_retry.get("accepted"):
+                _emit_rewrite_stage(
+                    state,
+                    "rewrite-similarity-check",
+                    f"相似度偏高，已自动降重：{high_retry.get('original_similarity')}% -> {high_retry.get('similarity')}%。",
+                )
+            else:
+                _emit_rewrite_stage(state, "rewrite-similarity-check", "相似度仍偏高，已保留当前稿并标记人工复核。")
         body_markdown = rewrite_result or _body_for(
             trend,
             evidence,
@@ -416,8 +432,8 @@ def _compliance_report(body_markdown: str, primary: NormalizedContent | None) ->
 
 
 def _compliance_result(body_markdown: str, primary: NormalizedContent | None) -> dict[str, object]:
-    source_text = _comparison_text(f"{primary.title}\n{primary.text}" if primary else "")
-    rewrite_text = _comparison_text(_published_text_for_similarity(body_markdown))
+    source_text = _comparison_text(_source_body_for_similarity(primary))
+    rewrite_text = _comparison_text(_rewrite_body_for_similarity(body_markdown))
     similarity = _similarity_percent(source_text, rewrite_text)
     compliant = REWRITE_SIMILARITY_MIN <= similarity <= REWRITE_SIMILARITY_MAX
     return {
@@ -439,20 +455,53 @@ def _compliance_report_from_result(compliance: dict[str, object]) -> str:
     if compliant:
         reason = "与原文保持适度贴近，结构和信息没有大幅偏离，可进入发布前人工校对。"
     elif similarity < min_similarity:
-        reason = "与原文相似度偏低，说明改动过大；建议恢复原文结构、信息顺序和关键表达。"
+        reason = "正文相似度偏低，说明改动过大；建议恢复原文结构、信息顺序和关键表达。"
     else:
-        reason = "与原文相似度偏高，建议替换连续句式和局部表达，但不要大改原文结构。"
+        reason = "正文相似度偏高，建议替换连续句式和局部表达，但不要大改原文结构。"
     return f"""### 合规检测
 
-- 与原文相似度：{similarity}%
+- 正文相似度：{similarity}%（仅比较原文正文与《公众号改写正文》）
 - 合规判断：{verdict}
 - 判断标准：目标相似度为 {min_similarity}%-{max_similarity}%；低于 {min_similarity}% 说明改动过大，高于 {max_similarity}% 说明过于接近
 - 说明：{reason}"""
 
 
+def _source_body_for_similarity(primary: NormalizedContent | None) -> str:
+    if primary is None:
+        return ""
+    return (primary.text or "").strip()
+
+
+def _rewrite_body_for_similarity(body_markdown: str) -> str:
+    body = _published_body_section(body_markdown)
+    if not body.strip():
+        return ""
+    without_image_cards = re.sub(
+        r"<section\b[^>]*>.*?配图建议.*?</section>",
+        " ",
+        body,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+    return without_image_cards
+
+
 def _published_text_for_similarity(body_markdown: str) -> str:
-    text = re.split(r"\n### 内部改写依据\b|\n### wechat-rewrite 任务 Prompt\b", body_markdown, maxsplit=1)[0]
-    return text
+    return _rewrite_body_for_similarity(body_markdown)
+
+
+def _published_body_section(body_markdown: str) -> str:
+    match = re.search(
+        r"###\s*公众号改写正文\s*(.+?)(?:\n###\s*(?:来源与复核提醒|配图建议|发布风险自查|Tags|内部改写依据|wechat-rewrite 任务 Prompt|合规检测)\b|$)",
+        body_markdown,
+        flags=re.DOTALL,
+    )
+    if match:
+        return match.group(1)
+    return re.split(
+        r"\n###\s*(?:来源与复核提醒|配图建议|发布风险自查|Tags|内部改写依据|wechat-rewrite 任务 Prompt|合规检测)\b",
+        body_markdown,
+        maxsplit=1,
+    )[0]
 
 
 def _comparison_text(value: str) -> str:
@@ -725,6 +774,127 @@ def _with_similarity_retry_usage(
         "similarity": similarity,
         "retry_usage": retry_usage,
         "deterministic_fallback": deterministic,
+    }
+    return payload
+
+
+def _repair_high_similarity_rewrite_if_needed(
+    rewrite_result: str | None,
+    llm_usage: dict[str, Any] | None,
+    *,
+    primary: NormalizedContent | None,
+    rewrite_prompt: str,
+) -> tuple[str | None, dict[str, Any] | None]:
+    if not rewrite_result or primary is None:
+        return rewrite_result, llm_usage
+    if isinstance(llm_usage, dict) and isinstance(llm_usage.get("similarity_retry"), dict):
+        if llm_usage["similarity_retry"].get("forced_source_preserving_fallback"):
+            return rewrite_result, llm_usage
+    compliance = _compliance_result(rewrite_result, primary)
+    similarity = int(compliance.get("similarity") or 0)
+    min_similarity = int(compliance.get("min_similarity") or REWRITE_SIMILARITY_MIN)
+    max_similarity = int(compliance.get("max_similarity") or REWRITE_SIMILARITY_MAX)
+    if similarity <= max_similarity:
+        return rewrite_result, llm_usage
+    dedupe_prompt = _high_similarity_dedupe_prompt(
+        rewrite_result,
+        primary,
+        current_similarity=similarity,
+        original_prompt=rewrite_prompt,
+    )
+    retry_result, retry_usage = _execute_rewrite_prompt(dedupe_prompt)
+    if not retry_result:
+        return rewrite_result, _with_high_similarity_retry_usage(
+            llm_usage,
+            retry_usage,
+            original_similarity=similarity,
+            similarity=similarity,
+            accepted=False,
+        )
+    retry_compliance = _compliance_result(retry_result, primary)
+    retry_similarity = int(retry_compliance.get("similarity") or 0)
+    accepted = _should_accept_high_similarity_retry(
+        original_similarity=similarity,
+        retry_similarity=retry_similarity,
+        min_similarity=min_similarity,
+        max_similarity=max_similarity,
+    )
+    if accepted:
+        return retry_result, _with_high_similarity_retry_usage(
+            llm_usage,
+            retry_usage,
+            original_similarity=similarity,
+            similarity=retry_similarity,
+            accepted=True,
+        )
+    return rewrite_result, _with_high_similarity_retry_usage(
+        llm_usage,
+        retry_usage,
+        original_similarity=similarity,
+        similarity=retry_similarity,
+        accepted=False,
+    )
+
+
+def _should_accept_high_similarity_retry(
+    *,
+    original_similarity: int,
+    retry_similarity: int,
+    min_similarity: int,
+    max_similarity: int,
+) -> bool:
+    if min_similarity <= retry_similarity <= max_similarity:
+        return True
+    if retry_similarity < original_similarity and retry_similarity >= min_similarity:
+        return True
+    return False
+
+
+def _high_similarity_dedupe_prompt(
+    current_draft: str,
+    primary: NormalizedContent,
+    *,
+    current_similarity: int,
+    original_prompt: str,
+) -> str:
+    source_text = primary.text or primary.title or ""
+    return f"""你是微信公众号原创改写专家。当前改写稿与原文正文的相似度为 {current_similarity}%，高于目标区间 {REWRITE_SIMILARITY_MIN}%-{REWRITE_SIMILARITY_MAX}%。
+
+请在**不改变原文信息顺序、章节主线和核心事实**的前提下，对《### 公众号改写正文》部分做降重改写：
+1. 替换连续句式、固定搭配和明显同词同序表达，必要时补充少量类比或解释句。
+2. 不要删除原文段落覆盖范围，不要重排章节，不要换成另一篇文章，不要编造案例、数据或官方结论。
+3. 保留输出章节结构：改写标题、标题候选、公众号改写正文、来源与复核提醒、配图建议、发布风险自查、Tags。
+4. 正文仍使用微信富文本 HTML（section/p/h2/ul/ol/li/blockquote/strong/span/br + 内联 style），正文配图占位卡片格式不变。
+5. 目标：改写正文与原文正文的相似度控制在 {REWRITE_SIMILARITY_MIN}%-{REWRITE_SIMILARITY_MAX}%。
+
+【原文正文】
+{source_text}
+
+【当前改写稿】
+{current_draft}
+
+【原始改写要求（供参考，不要逐字复述）】
+{original_prompt}
+
+请直接输出完整修订稿，不要解释过程。"""
+
+
+def _with_high_similarity_retry_usage(
+    usage: dict[str, Any] | None,
+    retry_usage: dict[str, Any] | None,
+    *,
+    original_similarity: int,
+    similarity: int,
+    accepted: bool,
+) -> dict[str, Any] | None:
+    if usage is None:
+        return None
+    payload = dict(usage)
+    payload["high_similarity_retry"] = {
+        "accepted": accepted,
+        "original_similarity": original_similarity,
+        "similarity": similarity,
+        "retry_usage": retry_usage,
     }
     return payload
 

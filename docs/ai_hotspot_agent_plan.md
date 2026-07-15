@@ -120,7 +120,7 @@ flowchart TD
 - 输出形态：今日 AI 热点榜、跨平台趋势、产品机会卡片、平台选题建议。
 - 数据策略：保留原始 payload 和标准化结果，方便后续复盘和替换真实 API。
 
-MVP 配置在 `app/config/mvp.py`，包括平台范围、核心指标、平台角色和默认 AI 关键词。
+共享常量集中在 `app/agents/constants.py`，包括 AI 分类关键词和平台权重。
 
 ## 工作流入口
 
